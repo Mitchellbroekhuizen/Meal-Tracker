@@ -60,20 +60,21 @@ document.getElementById('go').onclick = async () => {
     }
   });
   const tests = [
-    ['gemini-2.5-flash', { thinkingBudget: 0 }],
-    ['gemini-flash-lite-latest', null],
-    ['gemini-2.5-flash-lite', null],
-    ['gemini-flash-latest', null]
+    ['gemini-3.8-flash', { thinkingLevel: 'minimal' }],
+    ['gemini-3.8-flash', null],
+    ['gemini-3.5-flash-lite', { thinkingLevel: 'minimal' }],
+    ['gemini-3.5-flash', { thinkingLevel: 'minimal' }]
   ];
   for (const [model, thinking] of tests) {
-    const r = line(`<span class="wait">${model}…</span>`);
+    const label = model + (thinking ? ' (snel)' : ' (standaard)');
+    const r = line(`<span class="wait">${label}…</span>`);
     let b = JSON.parse(body); if (thinking) b.generationConfig.thinkingConfig = thinking;
     const res = await timed(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`,
       { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b) }, 60000);
     let info = '';
     try { const j = JSON.parse(res.txt); info = j.candidates ? (j.candidates[0].finishReason + ': ' + (j.candidates[0].content?.parts?.[0]?.text || '').slice(0, 120)) : (j.error?.message || res.txt).slice(0, 220); }
     catch (e) { info = res.txt.slice(0, 220); }
-    r.innerHTML = `${model}: <b class="${res.status === 200 ? 'ok' : 'bad'}">${res.status}</b> in ${(res.ms / 1000).toFixed(1)} s<br><small>${esc(info)}</small>`;
+    r.innerHTML = `${label}: <b class="${res.status === 200 ? 'ok' : 'bad'}">${res.status}</b> in ${(res.ms / 1000).toFixed(1)} s<br><small>${esc(info)}</small>`;
   }
   line('<b>Klaar.</b> Maak een screenshot en stuur hem door.');
   btn.disabled = false;

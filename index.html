@@ -130,8 +130,8 @@ try {
 // ==========================================
 // Gemini API-sleutel: wordt alleen lokaal op dit apparaat bewaard (niet in de repo)
 const API_KEY_STORAGE = 'nutripulse_gemini_key';
-const GEMINI_MODEL = 'gemini-flash-latest';
-const APP_VERSION = '6';
+const GEMINI_MODEL = 'gemini-3.8-flash';
+const APP_VERSION = '7';
 function getApiKey() {
   try { return localStorage.getItem(API_KEY_STORAGE) || ''; } catch (e) { return ''; }
 }
@@ -257,9 +257,10 @@ async function fetchOnce(url, options, timeoutMs) {
 // Probeert meerdere Gemini-modellen: valt terug als een model niet bestaat, overbelast is of te traag is
 // Snelle modellen eerst, zonder lang "nadenken"
 const GEMINI_MODELS = [
-  { name: 'gemini-2.5-flash', thinking: { thinkingBudget: 0 } },
-  { name: 'gemini-flash-lite-latest', thinking: { thinkingBudget: 0 } },
-  { name: 'gemini-flash-latest', thinking: { thinkingLevel: 'low' } }
+  { name: 'gemini-3.8-flash', thinking: { thinkingLevel: 'minimal' } },
+  { name: 'gemini-3.5-flash-lite', thinking: { thinkingLevel: 'minimal' } },
+  { name: 'gemini-3.5-flash', thinking: { thinkingLevel: 'minimal' } },
+  { name: 'gemini-flash-latest', thinking: { thinkingLevel: 'minimal' } }
 ];
 let preferredModelIndex = 0; // onthoudt welk model het laatst werkte
 
