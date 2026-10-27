@@ -1,0 +1,3245 @@
+import React, { useState, useEffect, useRef, useMemo } from 'react';
+import { initializeApp } from 'firebase/app';
+import { 
+  getAuth, 
+  signInAnonymously, 
+  signInWithCustomToken, 
+  onAuthStateChanged 
+} from 'firebase/auth';
+import { 
+  getFirestore, 
+  doc, 
+  setDoc, 
+  onSnapshot, 
+  collection, 
+  addDoc, 
+  deleteDoc, 
+  updateDoc 
+} from 'firebase/firestore';
+import { 
+  Camera, 
+  Plus, 
+  Calendar, 
+  ChevronLeft, 
+  ChevronRight, 
+  Droplets, 
+  Flame, 
+  Beef, 
+  Wheat, 
+  Droplet, 
+  Clock, 
+  Sparkles, 
+  Utensils, 
+  Bell, 
+  CheckCircle2, 
+  Trash2, 
+  ChefHat, 
+  Search, 
+  User, 
+  Activity, 
+  Sun, 
+  Moon, 
+  Dumbbell, 
+  Coffee, 
+  ArrowRight, 
+  RefreshCw,
+  Info,
+  AlertCircle,
+  Bookmark,
+  Check,
+  X,
+  Upload,
+  Edit3,
+  Download,
+  Smartphone,
+  FileSpreadsheet,
+  HardDriveDownload
+} from 'lucide-react';
+
+// ==========================================
+// VEILIGE FIREBASE + LOCALSTORAGE PERSISTENTIE
+// ==========================================
+let app = null;
+let auth = null;
+let db = null;
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-meal-coach-id';
+
+try {
+  const rawConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+  if (rawConfig && rawConfig.apiKey) {
+    app = initializeApp(rawConfig);
+    auth = getAuth(app);
+    db = getFirestore(app);
+  }
+} catch (e) {
+  console.warn("Lokale opslag modus actief:", e);
+}
+
+// ==========================================
+// GEMINI API HELPERS MET EXPONENTIAL BACKOFF
+// ==========================================
+const apiKey = ""; // Wordt automatisch ingevuld door de omgeving
+
+async function fetchWithRetry(url, options, maxRetries = 4) {
+  let delay = 1000;
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      const response = await fetch(url, options);
+      if (response.ok) {
+        return await response.json();
+      }
+      if (response.status !== 429 && response.status < 500) {
+        const errText = await response.text();
+        throw new Error(`API Fout (${response.status}): ${errText}`);
+      }
+    } catch (err) {
+      if (i === maxRetries - 1) throw err;
+    }
+    await new Promise(resolve => setTimeout(resolve, delay));
+    delay *= 2;
+  }
+}
+
+// 1. Analyseer Foto van Maaltijd
+async function analyzeMealImageWithGemini(base64Data, mimeType = "image/jpeg", extraNote = "") {
+  const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`;
+  
+  const prompt = `Je bent een deskundige Nederlandse diëtist en voedingswetenschapper. Analyseer deze foto van een maaltijd of snack. 
+  ${extraNote ? `Extra context van de gebruiker: "${extraNote}".` : ''}
+  Herken alle ingrediënten op het bord/in beeld, schat het portiegewicht zo nauwkeurig mogelijk in, en bereken de totale voedingswaarde.
+  Geef het antwoord uitsluitend terug volgens het opgegeven JSON schema in het Nederlands.`;
+
+  const payload = {
+    contents: [{
+      role: "user",
+      parts: [
+        { text: prompt },
+        { inlineData: { mimeType, data: base64Data } }
+      ]
+    }],
+    generationConfig: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: "OBJECT",
+        properties: {
+          mealName: { type: "STRING", description: "Korte, duidelijke Nederlandse naam van de maaltijd" },
+          estimatedPortion: { type: "STRING", description: "Geschatte portiegrootte (bijv. '1 bord (ca. 450g)')" },
+          calories: { type: "NUMBER", description: "Totaal aantal kilocalorieën (kcal)" },
+          protein: { type: "NUMBER", description: "Totaal gram eiwitten" },
+          carbs: { type: "NUMBER", description: "Totaal gram koolhydraten" },
+          fat: { type: "NUMBER", description: "Totaal gram vetten" },
+          detectedItems: {
+            type: "ARRAY",
+            items: { type: "STRING" },
+            description: "Lijst met gedetecteerde ingrediënten en hun geschatte gewicht"
+          },
+          healthTip: { type: "STRING", description: "Een korte, positieve voedingstip over deze maaltijd (1-2 zinnen)" },
+          suggestedMealType: { 
+            type: "STRING", 
+            description: "Kies uit: Ontbijt, Lunch, Avondeten, Tussendoortje" 
+          }
+        },
+        propertyOrdering: ["mealName", "estimatedPortion", "calories", "protein", "carbs", "fat", "detectedItems", "healthTip", "suggestedMealType"]
+      }
+    }
+  };
+
+  const result = await fetchWithRetry(apiUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+
+  const text = result?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) throw new Error("Kon geen analyse maken van de foto.");
+  return JSON.parse(text);
+}
+
+// 2. Analyseer Tekstuele Omschrijving van Maaltijd
+async function analyzeMealTextWithGemini(description) {
+  const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`;
+  
+  const prompt = `Je bent een Nederlandse voedingsdeskundige. Bereken de voedingswaarden voor de volgende gegeten of gedronken items: "${description}".
+  Schat standaard Nederlandse portiegroottes in als die niet expliciet vermeld zijn.`;
+
+  const payload = {
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    generationConfig: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: "OBJECT",
+        properties: {
+          mealName: { type: "STRING" },
+          estimatedPortion: { type: "STRING" },
+          calories: { type: "NUMBER" },
+          protein: { type: "NUMBER" },
+          carbs: { type: "NUMBER" },
+          fat: { type: "NUMBER" },
+          detectedItems: { type: "ARRAY", items: { type: "STRING" } },
+          healthTip: { type: "STRING" },
+          suggestedMealType: { type: "STRING" }
+        },
+        propertyOrdering: ["mealName", "estimatedPortion", "calories", "protein", "carbs", "fat", "detectedItems", "healthTip", "suggestedMealType"]
+      }
+    }
+  };
+
+  const result = await fetchWithRetry(apiUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+
+  const text = result?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) throw new Error("Kon de tekst niet analyseren.");
+  return JSON.parse(text);
+}
+
+// 3. Persoonlijk Leefstijl & Maaltijdadvies op het huidige moment
+async function getLiveCoachAdvice(profile, todayStats, loggedMeals, currentTimeStr) {
+  const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`;
+
+  const mealSummary = loggedMeals.length > 0 
+    ? loggedMeals.map(m => `${m.time} (${m.mealType}): ${m.mealName} (${m.calories} kcal, ${m.protein}g E)`).join('; ')
+    : 'Nog niets gegeten vandaag.';
+
+  const prompt = `Je bent een persoonlijke Nederlandse Leefstijl & Voedingscoach. 
+  Het is nu ${currentTimeStr}.
+  Persoonlijk Profiel & Lichaamsgegevens:
+  - Geslacht: ${profile.gender === 'female' ? 'Vrouw' : 'Man'}, Leeftijd: ${profile.age} jaar, Gewicht: ${profile.weight} kg, Lengte: ${profile.height} cm
+  - Fysiek Doel: ${profile.goalType}
+  - Dagritme: Opstaan ${profile.wakeTime}, Slapen ${profile.sleepTime}
+  - Werk & Dagelijkse Activiteit: ${profile.workActivity} (${profile.lifestyleType})
+  - Sportfrequentie: ${profile.workoutsPerWeek}x per week (Sporttijd vandaag: ${profile.workoutTime || 'Geen specifieke tijd'})
+  - Persoonlijke Dagdoelen: ${profile.calorieGoal} kcal, ${profile.proteinGoal}g eiwit, ${profile.carbsGoal}g koolhydraten, ${profile.fatGoal}g vet, ${profile.waterGoal}ml water.
+  
+  Status van vandaag tot nu toe:
+  - Gegeten: ${todayStats.calories} kcal, ${todayStats.protein}g eiwit, ${todayStats.carbs}g koolhydraten, ${todayStats.fat}g vet.
+  - Water gedronken: ${todayStats.water} ml.
+  - Gelogde maaltijden vandaag: ${mealSummary}
+
+  Geef concreet, motiverend advies voor DIT specifieke tijdstip op basis van hun persoonlijke lichaam, werk en dagelijkse leven.`;
+
+  const payload = {
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    generationConfig: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: "OBJECT",
+        properties: {
+          headline: { type: "STRING", description: "Pakkende kop voor dit moment van de dag" },
+          rightNowAction: { type: "STRING", description: "Wat kan de gebruiker NU het beste doen (eten/drinken/rusten)?" },
+          nextMealTiming: { type: "STRING", description: "Ideale tijdstip en reden voor het eerstvolgende eetmoment" },
+          concreteSuggestions: {
+            type: "ARRAY",
+            items: {
+              type: "OBJECT",
+              properties: {
+                title: { type: "STRING" },
+                why: { type: "STRING" },
+                calories: { type: "NUMBER" },
+                protein: { type: "NUMBER" }
+              },
+              propertyOrdering: ["title", "why", "calories", "protein"]
+            },
+            description: "2 of 3 concrete snack- of maaltijdopties die passen bij de resterende macro's"
+          },
+          hydrationAdvice: { type: "STRING", description: "Advies over hun waterinname op dit tijdstip" }
+        },
+        propertyOrdering: ["headline", "rightNowAction", "nextMealTiming", "concreteSuggestions", "hydrationAdvice"]
+      }
+    }
+  };
+
+  const result = await fetchWithRetry(apiUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+
+  const text = result?.candidates?.[0]?.content?.parts?.[0]?.text;
+  return JSON.parse(text);
+}
+
+// 4. Recepten Zoeker & Generator
+async function generateRecipesWithGemini(query, remainingMacros, filterTag) {
+  const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`;
+
+  const prompt = `Genereer 3 heerlijke, gezonde en praktisch te bereiden Nederlandse recepten.
+  Zoekopdracht van gebruiker: "${query || 'Verras me met gezonde maaltijden'}"
+  Specifieke voorkeur/filter: "${filterTag || 'Geen'}"
+  Resterende macro's van de gebruiker voor vandaag: ca. ${Math.max(300, remainingMacros.calories)} kcal en ${Math.max(20, remainingMacros.protein)}g eiwit.
+  Zorg dat de recepten goed verkrijgbare ingrediënten uit de Nederlandse supermarkt bevatten.`;
+
+  const payload = {
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    generationConfig: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: "ARRAY",
+        items: {
+          type: "OBJECT",
+          properties: {
+            title: { type: "STRING" },
+            shortDescription: { type: "STRING" },
+            prepTimeMinutes: { type: "NUMBER" },
+            mealType: { type: "STRING", description: "Ontbijt, Lunch, Avondeten of Tussendoortje" },
+            calories: { type: "NUMBER" },
+            protein: { type: "NUMBER" },
+            carbs: { type: "NUMBER" },
+            fat: { type: "NUMBER" },
+            ingredients: {
+              type: "ARRAY",
+              items: { type: "STRING" },
+              description: "Ingrediënten voor 1 persoon met exacte hoeveelheden"
+            },
+            instructions: {
+              type: "ARRAY",
+              items: { type: "STRING" },
+              description: "Duidelijke stap-voor-stap bereidingswijze"
+            },
+            tags: {
+              type: "ARRAY",
+              items: { type: "STRING" }
+            }
+          },
+          propertyOrdering: ["title", "shortDescription", "prepTimeMinutes", "mealType", "calories", "protein", "carbs", "fat", "ingredients", "instructions", "tags"]
+        }
+      }
+    }
+  };
+
+  const result = await fetchWithRetry(apiUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+
+  const text = result?.candidates?.[0]?.content?.parts?.[0]?.text;
+  return JSON.parse(text);
+}
+
+// ==========================================
+// WETENSCHAPPELIJKE BMR, TDEE & MACRO CALCULATOR
+// (Mifflin-St Jeor Formule)
+// ==========================================
+const WORK_ACTIVITY_LEVELS = {
+  sedentary: {
+    label: "Zittend / Kantoorwerk",
+    desc: "Voornamelijk zittend werk achter bureau of thuis, weinig lopen onder werktijd",
+    factor: 1.2
+  },
+  light: {
+    label: "Licht actief / Staand of lopend werk",
+    desc: "Onderwijs, winkel, zorg of regelmatig wandelen gedurende de dag",
+    factor: 1.35
+  },
+  active: {
+    label: "Actief / Fysiek werk of magazijn",
+    desc: "Horeca, magazijn, bezorging of veel in beweging op de werkvloer",
+    factor: 1.52
+  },
+  very_active: {
+    label: "Zeer zwaar fysiek werk",
+    desc: "Bouw, stratenmaker, landbouw of zware lichamelijke arbeid",
+    factor: 1.72
+  }
+};
+
+const GOAL_TYPES = {
+  cut_fast: {
+    label: "Afvallen / Cutten (-500 kcal)",
+    kcalDelta: -500,
+    proteinPerKg: 2.1,
+    fatPerKg: 0.85
+  },
+  cut_mild: {
+    label: "Licht afvallen (-250 kcal)",
+    kcalDelta: -250,
+    proteinPerKg: 2.0,
+    fatPerKg: 0.9
+  },
+  maintain: {
+    label: "Op gewicht blijven / Onderhoud",
+    kcalDelta: 0,
+    proteinPerKg: 1.8,
+    fatPerKg: 0.95
+  },
+  lean_bulk: {
+    label: "Droge spiermassa / Lean Bulk (+250 kcal)",
+    kcalDelta: 250,
+    proteinPerKg: 2.0,
+    fatPerKg: 1.0
+  },
+  bulk: {
+    label: "Aankomen / Spiergroei (+500 kcal)",
+    kcalDelta: 500,
+    proteinPerKg: 2.0,
+    fatPerKg: 1.05
+  }
+};
+
+function calculatePersonalNutrition(profileData) {
+  const gender = profileData.gender || 'male';
+  const age = Math.max(14, Math.min(100, Number(profileData.age) || 28));
+  const weight = Math.max(35, Math.min(250, Number(profileData.weight) || 80));
+  const height = Math.max(120, Math.min(230, Number(profileData.height) || 180));
+  const workKey = WORK_ACTIVITY_LEVELS[profileData.workActivity] ? profileData.workActivity : 'sedentary';
+  const workoutsPerWeek = Math.max(0, Math.min(10, Number(profileData.workoutsPerWeek) ?? 3));
+  const goalKey = GOAL_TYPES[profileData.goalType] ? profileData.goalType : 'maintain';
+
+  // 1. Mifflin-St Jeor BMR (Rustverbranding)
+  const baseBmr = (10 * weight) + (6.25 * height) - (5 * age);
+  const bmr = Math.round(gender === 'female' ? baseBmr - 161 : baseBmr + 5);
+
+  // 2. Totale Dagelijkse Energiebehoefte (TDEE) = Werkfactor + Sporttoeslag
+  const workFactor = WORK_ACTIVITY_LEVELS[workKey].factor;
+  const workoutBonusMultiplier = workoutsPerWeek * 0.045; // ~4.5% extra BMR per wekelijkse sportsessie
+  const totalMultiplier = workFactor + workoutBonusMultiplier;
+  const tdee = Math.round(bmr * totalMultiplier);
+
+  // 3. Dagelijks Caloriedoel op basis van gekozen doel
+  const goalObj = GOAL_TYPES[goalKey];
+  const minSafeCalories = gender === 'female' ? 1250 : 1500;
+  const calorieGoal = Math.max(minSafeCalories, Math.round(tdee + goalObj.kcalDelta));
+
+  // 4. Macro's berekenen op basis van lichaamsgewicht
+  const proteinGoal = Math.round(weight * goalObj.proteinPerKg);
+  const fatGoal = Math.max(40, Math.round(weight * goalObj.fatPerKg));
+  const usedCalories = (proteinGoal * 4) + (fatGoal * 9);
+  const remainingForCarbs = Math.max(200, calorieGoal - usedCalories);
+  const carbsGoal = Math.round(remainingForCarbs / 4);
+
+  // 5. Persoonlijke Waterbehoefte (35ml per kg + extra voor sport & actief werk)
+  const baseWater = weight * 35;
+  const workWaterBonus = (workKey === 'active' || workKey === 'very_active') ? 400 : (workKey === 'light' ? 200 : 0);
+  const sportWaterBonus = Math.round((workoutsPerWeek * 450) / 7);
+  const waterGoal = Math.round((baseWater + workWaterBonus + sportWaterBonus) / 50) * 50;
+
+  return {
+    bmr,
+    tdee,
+    calorieGoal,
+    proteinGoal,
+    carbsGoal,
+    fatGoal,
+    waterGoal
+  };
+}
+
+// ==========================================
+// STANDAARD RECEPTEN & CONFIGURATIE
+// ==========================================
+const INITIAL_BIO = {
+  name: "Sportieve Genieter",
+  gender: "male",
+  age: 28,
+  weight: 80,
+  height: 180,
+  workActivity: "sedentary",
+  workoutsPerWeek: 3,
+  goalType: "maintain",
+  autoCalculate: true,
+  wakeTime: "07:00",
+  sleepTime: "23:00",
+  lifestyleType: "Kantoorbaan + Avondsport",
+  workoutTime: "18:30",
+  remindersEnabled: true
+};
+
+const INITIAL_CALC = calculatePersonalNutrition(INITIAL_BIO);
+
+const DEFAULT_PROFILE = {
+  ...INITIAL_BIO,
+  ...INITIAL_CALC
+};
+
+const STARTER_RECIPES = [
+  {
+    id: "starter-1",
+    title: "Krokante Zalm Bowl met Edamame & Zilvervliesrijst",
+    shortDescription: "Een voedzame avondmaaltijd vol gezonde omega-3 vetzuren, complexe koolhydraten en hoogwaardige eiwitten.",
+    prepTimeMinutes: 20,
+    mealType: "Avondeten",
+    calories: 580,
+    protein: 42,
+    carbs: 54,
+    fat: 21,
+    ingredients: [
+      "150g verse zalmfilet (in blokjes)",
+      "75g ongekookte zilvervliesrijst",
+      "80g edamame boontjes (voorgekookt)",
+      "1/2 komkommer in blokjes",
+      "1 el sojasaus (minder zout) & 1 tl sesamolie",
+      "1 tl sesamzaadjes en lente-ui"
+    ],
+    instructions: [
+      "Kook de zilvervliesrijst volgens de aanwijzingen op de verpakking.",
+      "Marineer de zalmblokjes kort met de sojasaus en sesamolie.",
+      "Bak de zalm in een hete koekenpan of airfryer in 6-8 minuten goudbruin en gaar.",
+      "Schep de rijst in een kom, verdeel de edamame, komkommer en zalm erover en garneer met sesamzaad en lente-ui."
+    ],
+    tags: ["Eiwitrijk", "Omega-3", "Binnen 20 min"]
+  },
+  {
+    id: "starter-2",
+    title: "Romige Kwarkbowl met Warme Bosbessen & Havermout",
+    shortDescription: "Ideale start van je dag die je bloedsuikerspiegel stabiel houdt tot aan de lunch.",
+    prepTimeMinutes: 8,
+    mealType: "Ontbijt",
+    calories: 410,
+    protein: 34,
+    carbs: 48,
+    fat: 8,
+    ingredients: [
+      "250g magere kwark of Skyr",
+      "40g volkoren havermout",
+      "100g diepvries bosbessen",
+      "10g ongebrande walnoten of amandelen",
+      "Snufje kaneel"
+    ],
+    instructions: [
+      "Verwarm de diepvries bosbessen 1 minuut in een pannetje of magnetron tot ze warm en sappig zijn.",
+      "Schep de kwark in een kom en roer de havermout en kaneel erdoor.",
+      "Schep de warme bosbessen eroverheen en maak af met de gehakte noten."
+    ],
+    tags: ["Ontbijt", "Snel", "Hoog Eiwit"]
+  },
+  {
+    id: "starter-3",
+    title: "Volkoren Wrap met Kipfilet, Hüttenkäse & Avocado",
+    shortDescription: "Lichte maar verzadigende lunch die je makkelijk mee kunt nemen of thuis in 5 minuten klaarmaakt.",
+    prepTimeMinutes: 10,
+    mealType: "Lunch",
+    calories: 475,
+    protein: 38,
+    carbs: 39,
+    fat: 17,
+    ingredients: [
+      "2 volkoren wraps (medium)",
+      "100g gerookte kipfilet (plakjes of reepjes)",
+      "80g Hüttenkäse (cottage cheese)",
+      "1/3 rijpe avocado in plakjes",
+      "Handje rucola en peper naar smaak"
+    ],
+    instructions: [
+      "Besmeer de volkoren wraps met de Hüttenkäse.",
+      "Beleg met de rucola, gerookte kipfilet en plakjes avocado.",
+      "Breng op smaak met versgemalen zwarte peper, rol strak op en snijd doormidden."
+    ],
+    tags: ["Lunch", "Meeneem", "Gezonde Vetten"]
+  }
+];
+
+// ==========================================
+// HULPFUNCTIES VOOR DATUMS EN TIJDSCHEMA
+// ==========================================
+function formatDateKey(dateObj) {
+  const year = dateObj.getFullYear();
+  const month = String(dateObj.getMonth() + 1).padStart(2, '0');
+  const day = String(dateObj.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function getDutchDateLabel(dateKey) {
+  const todayKey = formatDateKey(new Date());
+  const yesterday = new Date();
+  yesterday.setDate(yesterday.getDate() - 1);
+  const yesterdayKey = formatDateKey(yesterday);
+
+  if (dateKey === todayKey) return "Vandaag";
+  if (dateKey === yesterdayKey) return "Gisteren";
+
+  const [y, m, d] = dateKey.split('-').map(Number);
+  const dateObj = new Date(y, m - 1, d);
+  return dateObj.toLocaleDateString('nl-NL', { weekday: 'short', day: 'numeric', month: 'short' });
+}
+
+function timeToMinutes(timeStr) {
+  if (!timeStr || !timeStr.includes(':')) return 420;
+  const [h, m] = timeStr.split(':').map(Number);
+  return h * 60 + m;
+}
+
+function minutesToTime(mins) {
+  const normalized = ((mins % 1440) + 1440) % 1440;
+  const h = Math.floor(normalized / 60);
+  const m = normalized % 60;
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+}
+
+// Genereert een slim dagschema op basis van opsta-tijd, slaaptijd en leefstijl
+function generateSmartSchedule(profile, todayStats, loggedMeals) {
+  const wakeMins = timeToMinutes(profile.wakeTime || "07:00");
+  const sleepMins = timeToMinutes(profile.sleepTime || "23:00");
+  const workoutMins = profile.workoutTime ? timeToMinutes(profile.workoutTime) : null;
+
+  const hasBreakfast = loggedMeals.some(m => m.mealType === "Ontbijt");
+  const hasLunch = loggedMeals.some(m => m.mealType === "Lunch");
+  const hasDinner = loggedMeals.some(m => m.mealType === "Avondeten");
+  const hasSnack = loggedMeals.some(m => m.mealType === "Tussendoortje");
+
+  const schedule = [
+    {
+      id: "wake-water",
+      time: minutesToTime(wakeMins + 15),
+      mins: wakeMins + 15,
+      type: "water",
+      title: "Ochtend Hydratatie (300 ml)",
+      advice: "Drink direct na het opstaan een groot glas water om je stofwisseling en hersenen op te starten na je slaap.",
+      completed: todayStats.water >= 250
+    },
+    {
+      id: "breakfast",
+      time: minutesToTime(wakeMins + 45),
+      mins: wakeMins + 45,
+      type: "meal",
+      mealCategory: "Ontbijt",
+      title: "Eiwitrijk Ontbijt",
+      advice: `Richt op ~${Math.round(profile.proteinGoal * 0.25)}g eiwit en complexe vezels zodat je geen ochtenddip krijgt.`,
+      completed: hasBreakfast
+    },
+    {
+      id: "mid-morning-water",
+      time: minutesToTime(wakeMins + 180),
+      mins: wakeMins + 180,
+      type: "water",
+      title: "Voormiddag Drinkmoment",
+      advice: "Neem een glas water of groene thee. Vaak voelt lichte uitdroging rond 10:30 uur als trek in zoetigheid.",
+      completed: todayStats.water >= 750
+    },
+    {
+      id: "lunch",
+      time: minutesToTime(wakeMins + 315),
+      mins: wakeMins + 315,
+      type: "meal",
+      mealCategory: "Lunch",
+      title: "Energieke Lunch",
+      advice: "Combineer langzame koolhydraten met magere eiwitten en groenten voor blijvende focus in de middag.",
+      completed: hasLunch
+    },
+    {
+      id: "afternoon-snack",
+      time: minutesToTime(wakeMins + 510),
+      mins: wakeMins + 510,
+      type: "snack",
+      mealCategory: "Tussendoortje",
+      title: workoutMins ? "Pre-Workout / Middag Boost" : "Slimme 16:00u Snack",
+      advice: workoutMins 
+        ? "Je traint straks! Neem een lichte combinatie van fruit en eiwit voor optimale energie tijdens je training."
+        : "Voorkom dat je om 17:30 uur uitgehongerd gaat koken. Neem een handje noten, kwark of een gekookt eitje.",
+      completed: hasSnack
+    },
+    {
+      id: "afternoon-water",
+      time: minutesToTime(wakeMins + 570),
+      mins: wakeMins + 570,
+      type: "water",
+      title: "Middag Hydratatie Check",
+      advice: "Zorg dat je nu op minimaal 60% van je dagelijkse waterdoel zit.",
+      completed: todayStats.water >= (profile.waterGoal * 0.6)
+    },
+    {
+      id: "dinner",
+      time: minutesToTime(workoutMins ? Math.max(wakeMins + 690, workoutMins + 75) : wakeMins + 690),
+      mins: workoutMins ? Math.max(wakeMins + 690, workoutMins + 75) : wakeMins + 690,
+      type: "meal",
+      mealCategory: "Avondeten",
+      title: "Herstellend Avondeten",
+      advice: `Focus op verse groenten, ~${Math.round(profile.proteinGoal * 0.35)}g eiwit en een gebalanceerde portie koolhydraten.`,
+      completed: hasDinner
+    },
+    {
+      id: "evening-winddown",
+      time: minutesToTime(sleepMins - 90),
+      mins: sleepMins - 90,
+      type: "rest",
+      title: "Spijsverteringsrust & Ontspanning",
+      advice: "Eet het liefst geen zware maaltijden meer vlak voor het slapen voor een diepere herstelslaap. Kopje kamillethee kan wel!",
+      completed: false
+    }
+  ];
+
+  return schedule.sort((a, b) => a.mins - b.mins);
+}
+
+// ==========================================
+// HOOFD APPLICATIE COMPONENT
+// ==========================================
+export default function App() {
+  // Authenticatie & Gebruiker State
+  const [user, setUser] = useState(null);
+  const [authReady, setAuthReady] = useState(false);
+
+  // Navigatie State
+  const [activeTab, setActiveTab] = useState('dashboard'); // 'dashboard' | 'log' | 'coach' | 'profile' | 'recipes'
+  const [selectedDate, setSelectedDate] = useState(() => formatDateKey(new Date()));
+
+  // Data State (geladen vanuit localStorage voor directe persistentie + gesynchroniseerd met Firestore indien actief)
+  const [profile, setProfile] = useState(() => {
+    try {
+      const saved = localStorage.getItem('nutripulse_profile_v2');
+      if (saved) return { ...DEFAULT_PROFILE, ...JSON.parse(saved) };
+    } catch (e) {}
+    return DEFAULT_PROFILE;
+  });
+
+  const [allMeals, setAllMeals] = useState(() => {
+    try {
+      const saved = localStorage.getItem('nutripulse_meals_v2');
+      if (saved) return JSON.parse(saved);
+    } catch (e) {}
+    return [];
+  });
+
+  const [dailyWaterMap, setDailyWaterMap] = useState(() => {
+    try {
+      const saved = localStorage.getItem('nutripulse_water_v2');
+      if (saved) return JSON.parse(saved);
+    } catch (e) {}
+    return {};
+  });
+
+  const [savedRecipes, setSavedRecipes] = useState(() => {
+    try {
+      const saved = localStorage.getItem('nutripulse_recipes_v2');
+      if (saved) return JSON.parse(saved);
+    } catch (e) {}
+    return [];
+  });
+
+  // UI & Meldingen State
+  const [toastMessage, setToastMessage] = useState(null);
+  const [currentTime, setCurrentTime] = useState(new Date());
+  const [browserNotifPermission, setBrowserNotifPermission] = useState(
+    typeof Notification !== 'undefined' ? Notification.permission : 'default'
+  );
+  const [dismissedBannerId, setDismissedBannerId] = useState(null);
+  const [deferredInstallPrompt, setDeferredInstallPrompt] = useState(null);
+  const [showInstallModal, setShowInstallModal] = useState(false);
+
+  // Luister naar PWA Installatie event (voor browsers zoals Chrome/Edge/Android)
+  useEffect(() => {
+    const handleBeforeInstallPrompt = (e) => {
+      e.preventDefault();
+      setDeferredInstallPrompt(e);
+    };
+    window.addEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
+    return () => window.removeEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
+  }, []);
+
+  const handleInstallPwa = async () => {
+    if (deferredInstallPrompt) {
+      deferredInstallPrompt.prompt();
+      const { outcome } = await deferredInstallPrompt.userChoice;
+      if (outcome === 'accepted') {
+        showToast("NutriPulse wordt geïnstalleerd op je apparaat! 📱");
+      }
+      setDeferredInstallPrompt(null);
+    } else {
+      setShowInstallModal(true);
+    }
+  };
+
+  // Download alle gegevens als JSON back-up
+  const handleExportBackupJson = () => {
+    const backupData = {
+      appName: "NutriPulse AI Coach",
+      exportedAt: new Date().toISOString(),
+      profile,
+      allMeals,
+      dailyWaterMap,
+      savedRecipes
+    };
+    const blob = new Blob([JSON.stringify(backupData, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `nutripulse-backup-${formatDateKey(new Date())}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    showToast("Volledige back-up (.json) gedownload! 💾");
+  };
+
+  // Download maaltijdgeschiedenis als CSV voor Excel
+  const handleExportMealsCsv = () => {
+    const headers = ["Datum", "Tijd", "Maaltijdtype", "Naam", "Portie", "Calorieen (kcal)", "Eiwitten (g)", "Koolhydraten (g)", "Vetten (g)"];
+    const rows = allMeals.map(m => [
+      m.dateKey || "",
+      m.time || "",
+      `"${(m.mealType || "").replace(/"/g, '""')}"`,
+      `"${(m.mealName || "").replace(/"/g, '""')}"`,
+      `"${(m.estimatedPortion || "").replace(/"/g, '""')}"`,
+      m.calories || 0,
+      m.protein || 0,
+      m.carbs || 0,
+      m.fat || 0
+    ]);
+    const csvContent = [headers.join(","), ...rows.map(r => r.join(","))].join("\n");
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `nutripulse-dagboek-${formatDateKey(new Date())}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    showToast("Dagboek geëxporteerd naar Excel (.csv)! 📊");
+  };
+
+  // Importeer een eerder gedownloade JSON back-up
+  const handleImportBackupJson = (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const parsed = JSON.parse(e.target.result);
+        if (parsed.profile) setProfile(prev => ({ ...prev, ...parsed.profile }));
+        if (Array.isArray(parsed.allMeals)) setAllMeals(parsed.allMeals);
+        if (parsed.dailyWaterMap) setDailyWaterMap(parsed.dailyWaterMap);
+        if (Array.isArray(parsed.savedRecipes)) setSavedRecipes(parsed.savedRecipes);
+        showToast("Back-up succesvol ingeladen! ✨");
+      } catch (err) {
+        showToast("Ongeldig back-up bestand.", "error");
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  // Synchroniseer wijzigingen altijd direct naar localStorage
+  useEffect(() => {
+    try { localStorage.setItem('nutripulse_profile_v2', JSON.stringify(profile)); } catch (e) {}
+  }, [profile]);
+
+  useEffect(() => {
+    try { localStorage.setItem('nutripulse_meals_v2', JSON.stringify(allMeals)); } catch (e) {}
+  }, [allMeals]);
+
+  useEffect(() => {
+    try { localStorage.setItem('nutripulse_water_v2', JSON.stringify(dailyWaterMap)); } catch (e) {}
+  }, [dailyWaterMap]);
+
+  useEffect(() => {
+    try { localStorage.setItem('nutripulse_recipes_v2', JSON.stringify(savedRecipes)); } catch (e) {}
+  }, [savedRecipes]);
+
+  // ==========================================
+  // 1. FIREBASE AUTHENTICATIE
+  // ==========================================
+  useEffect(() => {
+    if (!auth) {
+      setAuthReady(true);
+      return;
+    }
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (err) {
+        console.warn("Authenticatie fallback naar lokale opslag:", err);
+      }
+    };
+    initAuth();
+
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
+      setAuthReady(true);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // ==========================================
+  // 2. FIRESTORE DATA LISTENERS
+  // ==========================================
+  useEffect(() => {
+    if (!user || !db) return;
+
+    // A. Luister naar Gebruikersprofiel & Ritme
+    const profileRef = doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'profile');
+    const unsubProfile = onSnapshot(
+      profileRef,
+      (docSnap) => {
+        if (docSnap.exists()) {
+          setProfile(prev => ({ ...DEFAULT_PROFILE, ...prev, ...docSnap.data() }));
+        } else {
+          setDoc(profileRef, profile).catch(console.error);
+        }
+      },
+      (err) => console.error("Profiel listener fout:", err)
+    );
+
+    // B. Luister naar Gelogde Maaltijden
+    const mealsRef = collection(db, 'artifacts', appId, 'users', user.uid, 'meals');
+    const unsubMeals = onSnapshot(
+      mealsRef,
+      (snapshot) => {
+        const loaded = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+        loaded.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+        if (loaded.length > 0) setAllMeals(loaded);
+      },
+      (err) => console.error("Maaltijden listener fout:", err)
+    );
+
+    // C. Luister naar Dagelijkse Waterinname
+    const waterRef = collection(db, 'artifacts', appId, 'users', user.uid, 'waterLogs');
+    const unsubWater = onSnapshot(
+      waterRef,
+      (snapshot) => {
+        const waterMap = {};
+        snapshot.docs.forEach(d => {
+          waterMap[d.id] = d.data().amountMl || 0;
+        });
+        if (Object.keys(waterMap).length > 0) {
+          setDailyWaterMap(prev => ({ ...prev, ...waterMap }));
+        }
+      },
+      (err) => console.error("Water listener fout:", err)
+    );
+
+    // D. Luister naar Opgeslagen Recepten
+    const recipesRef = collection(db, 'artifacts', appId, 'users', user.uid, 'savedRecipes');
+    const unsubRecipes = onSnapshot(
+      recipesRef,
+      (snapshot) => {
+        const list = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+        if (list.length > 0) setSavedRecipes(list);
+      },
+      (err) => console.error("Recepten listener fout:", err)
+    );
+
+    return () => {
+      unsubProfile();
+      unsubMeals();
+      unsubWater();
+      unsubRecipes();
+    };
+  }, [user]);
+
+  // Update klok elke minuut voor live tijdlijn & herinneringen
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setCurrentTime(new Date());
+    }, 30000);
+    return () => clearInterval(timer);
+  }, []);
+
+  // Toast helper
+  const showToast = (msg, type = "success") => {
+    setToastMessage({ text: msg, type });
+    setTimeout(() => {
+      setToastMessage(null);
+    }, 4000);
+  };
+
+  // ==========================================
+  // DATABASE & LOCALSTORAGE ACTIES
+  // ==========================================
+  const handleAddWater = async (deltaMl, targetDate = selectedDate) => {
+    const currentAmount = dailyWaterMap[targetDate] || 0;
+    const newAmount = Math.max(0, currentAmount + deltaMl);
+    
+    setDailyWaterMap(prev => ({ ...prev, [targetDate]: newAmount }));
+    if (deltaMl > 0) {
+      showToast(`+${deltaMl} ml water toegevoegd! 💧`);
+    }
+
+    if (user && db) {
+      try {
+        const waterDocRef = doc(db, 'artifacts', appId, 'users', user.uid, 'waterLogs', targetDate);
+        await setDoc(waterDocRef, { amountMl: newAmount, updatedAt: Date.now() }, { merge: true });
+      } catch (err) {
+        console.error("Fout bij water opslaan in cloud:", err);
+      }
+    }
+  };
+
+  const handleSaveMeal = async (mealData, targetDate = selectedDate) => {
+    const now = new Date();
+    const timeString = mealData.time || `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+    
+    const newMealObj = {
+      id: `local-${Date.now()}`,
+      mealName: mealData.mealName || "Maaltijd",
+      mealType: mealData.mealType || "Lunch",
+      calories: Math.round(Number(mealData.calories) || 0),
+      protein: Math.round(Number(mealData.protein) || 0),
+      carbs: Math.round(Number(mealData.carbs) || 0),
+      fat: Math.round(Number(mealData.fat) || 0),
+      estimatedPortion: mealData.estimatedPortion || "1 portie",
+      healthTip: mealData.healthTip || "",
+      dateKey: targetDate,
+      time: timeString,
+      createdAt: Date.now()
+    };
+
+    setAllMeals(prev => [...prev, newMealObj]);
+    showToast(`"${newMealObj.mealName}" opgeslagen in je dagboek!`);
+
+    if (user && db) {
+      try {
+        const mealsRef = collection(db, 'artifacts', appId, 'users', user.uid, 'meals');
+        const { id, ...firestorePayload } = newMealObj;
+        await addDoc(mealsRef, firestorePayload);
+      } catch (err) {
+        console.error("Fout bij maaltijd opslaan in cloud:", err);
+      }
+    }
+  };
+
+  const handleDeleteMeal = async (mealId) => {
+    setAllMeals(prev => prev.filter(m => m.id !== mealId));
+    showToast("Maaltijd verwijderd.");
+
+    if (user && db && !String(mealId).startsWith('local-')) {
+      try {
+        const mealDocRef = doc(db, 'artifacts', appId, 'users', user.uid, 'meals', mealId);
+        await deleteDoc(mealDocRef);
+      } catch (err) {
+        console.error("Fout bij verwijderen uit cloud:", err);
+      }
+    }
+  };
+
+  const handleUpdateProfile = async (newProfile) => {
+    setProfile(newProfile);
+    showToast("Jouw persoonlijke profiel & doelen zijn opgeslagen! 🎯");
+
+    if (user && db) {
+      try {
+        const profileRef = doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'profile');
+        await setDoc(profileRef, newProfile, { merge: true });
+      } catch (err) {
+        console.error("Fout bij profiel opslaan in cloud:", err);
+      }
+    }
+  };
+
+  const handleSaveRecipeToFavorites = async (recipe) => {
+    const newFav = {
+      ...recipe,
+      id: recipe.id || `fav-${Date.now()}`,
+      savedAt: Date.now()
+    };
+    setSavedRecipes(prev => [...prev, newFav]);
+    showToast(`Recept "${recipe.title}" opgeslagen bij je favorieten!`);
+
+    if (user && db) {
+      try {
+        const recipesRef = collection(db, 'artifacts', appId, 'users', user.uid, 'savedRecipes');
+        await addDoc(recipesRef, newFav);
+      } catch (err) {
+        console.error("Fout bij recept opslaan in cloud:", err);
+      }
+    }
+  };
+
+  const handleDeleteSavedRecipe = async (recipeId) => {
+    setSavedRecipes(prev => prev.filter(r => r.id !== recipeId));
+    showToast("Recept verwijderd uit favorieten.");
+
+    if (user && db && !String(recipeId).startsWith('fav-')) {
+      try {
+        const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'savedRecipes', recipeId);
+        await deleteDoc(docRef);
+      } catch (err) {
+        console.error("Fout bij recept verwijderen uit cloud:", err);
+      }
+    }
+  };
+
+  const requestNotificationPermission = async () => {
+    if (typeof Notification === 'undefined') {
+      showToast("Jouw browser ondersteunt geen systeemmeldingen, in-app meldingen staan wel aan!", "info");
+      return;
+    }
+    try {
+      const perm = await Notification.requestPermission();
+      setBrowserNotifPermission(perm);
+      if (perm === 'granted') {
+        new Notification("NutriPulse Coach Actief! 🥗", {
+          body: "Je ontvangt nu slimme herinneringen om op tijd te eten en water te drinken."
+        });
+        showToast("Meldingen succesvol geactiveerd!");
+      }
+    } catch (e) {
+      showToast("In-app coach herinneringen zijn actief!", "info");
+    }
+  };
+
+  // Datum wisselen
+  const changeDateByDays = (offset) => {
+    const [y, m, d] = selectedDate.split('-').map(Number);
+    const current = new Date(y, m - 1, d);
+    current.setDate(current.getDate() + offset);
+    setSelectedDate(formatDateKey(current));
+  };
+
+  // ==========================================
+  // AFGELEIDE DAGSTATISTIEKEN & SLIM SCHEMA
+  // ==========================================
+  const todayKey = formatDateKey(currentTime);
+
+  const mealsForSelectedDate = useMemo(() => {
+    return allMeals.filter(m => m.dateKey === selectedDate);
+  }, [allMeals, selectedDate]);
+
+  const selectedDateStats = useMemo(() => {
+    return {
+      calories: mealsForSelectedDate.reduce((sum, m) => sum + (Number(m.calories) || 0), 0),
+      protein: mealsForSelectedDate.reduce((sum, m) => sum + (Number(m.protein) || 0), 0),
+      carbs: mealsForSelectedDate.reduce((sum, m) => sum + (Number(m.carbs) || 0), 0),
+      fat: mealsForSelectedDate.reduce((sum, m) => sum + (Number(m.fat) || 0), 0),
+      water: Number(dailyWaterMap[selectedDate] || 0)
+    };
+  }, [mealsForSelectedDate, dailyWaterMap, selectedDate]);
+
+  const todayMeals = useMemo(() => {
+    return allMeals.filter(m => m.dateKey === todayKey);
+  }, [allMeals, todayKey]);
+
+  const todayStats = useMemo(() => {
+    return {
+      calories: todayMeals.reduce((sum, m) => sum + (Number(m.calories) || 0), 0),
+      protein: todayMeals.reduce((sum, m) => sum + (Number(m.protein) || 0), 0),
+      carbs: todayMeals.reduce((sum, m) => sum + (Number(m.carbs) || 0), 0),
+      fat: todayMeals.reduce((sum, m) => sum + (Number(m.fat) || 0), 0),
+      water: Number(dailyWaterMap[todayKey] || 0)
+    };
+  }, [todayMeals, dailyWaterMap, todayKey]);
+
+  const smartSchedule = useMemo(() => {
+    return generateSmartSchedule(profile, todayStats, todayMeals);
+  }, [profile, todayStats, todayMeals]);
+
+  const activeSmartPrompt = useMemo(() => {
+    const nowMins = currentTime.getHours() * 60 + currentTime.getMinutes();
+    const upcomingOrRecent = smartSchedule.find(
+      item => !item.completed && Math.abs(nowMins - item.mins) <= 60
+    );
+    return upcomingOrRecent || smartSchedule.find(item => !item.completed) || null;
+  }, [smartSchedule, currentTime]);
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans pb-24 selection:bg-emerald-500 selection:text-slate-950">
+      {/* BOVENSTE HEADER */}
+      <header className="sticky top-0 z-30 bg-slate-900/85 backdrop-blur-md border-b border-slate-800/80 px-4 py-3">
+        <div className="max-w-4xl mx-auto flex items-center justify-between">
+          <div className="flex items-center gap-2.5">
+            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-emerald-400 to-teal-600 flex items-center justify-center shadow-lg shadow-emerald-500/20">
+              <Sparkles className="w-5 h-5 text-slate-950 stroke-[2.5]" />
+            </div>
+            <div>
+              <h1 className="font-bold text-lg tracking-tight text-white leading-none flex items-center gap-2">
+                NutriPulse <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">AI Coach</span>
+              </h1>
+              <p className="text-xs text-slate-400 mt-0.5">Slimme Maaltijdscanner & Leefstijl Ritme</p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2">
+            {/* DOWNLOAD / INSTALLEER APP KNOP */}
+            <button
+              onClick={handleInstallPwa}
+              className="bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/30 text-emerald-300 text-xs font-semibold px-2.5 py-2 rounded-xl flex items-center gap-1.5 transition"
+              title="Download of installeer op telefoon/PC & exporteer data"
+            >
+              <Download className="w-3.5 h-3.5 text-emerald-400" />
+              <span className="hidden sm:inline">Download / App</span>
+            </button>
+
+            {/* DATUM SELECTOR */}
+            <div className="flex items-center bg-slate-800/90 rounded-xl p-1 border border-slate-700/70">
+              <button 
+                onClick={() => changeDateByDays(-1)}
+                className="p-1.5 hover:bg-slate-700 rounded-lg text-slate-300 transition"
+                title="Vorige dag"
+              >
+                <ChevronLeft className="w-4 h-4" />
+              </button>
+              <div className="px-2.5 flex items-center gap-1.5 text-xs sm:text-sm font-medium text-emerald-300">
+                <Calendar className="w-3.5 h-3.5 text-emerald-400 hidden sm:inline" />
+                <span>{getDutchDateLabel(selectedDate)}</span>
+              </div>
+              <button 
+                onClick={() => changeDateByDays(1)}
+                className="p-1.5 hover:bg-slate-700 rounded-lg text-slate-300 transition"
+                title="Volgende dag"
+              >
+                <ChevronRight className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      {/* MODAL VOOR APP INSTALLATIE & DATA DOWNLOADEN */}
+      {showInstallModal && (
+        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-700 rounded-3xl max-w-lg w-full max-h-[90vh] overflow-y-auto p-6 space-y-5 shadow-2xl">
+            <div className="flex items-start justify-between gap-4">
+              <div className="flex items-center gap-2.5">
+                <div className="p-2.5 rounded-2xl bg-emerald-500/15 text-emerald-400">
+                  <Smartphone className="w-6 h-6" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-bold text-white">App Installeren & Downloads</h3>
+                  <p className="text-xs text-slate-400">Zet NutriPulse op je startscherm of download je data</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowInstallModal(false)}
+                className="p-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* OPTIE 1: OP TELEFOON ZETTEN ALS WEBAPP */}
+            <div className="bg-slate-950 border border-slate-800 rounded-2xl p-4 space-y-3">
+              <h4 className="text-sm font-bold text-emerald-400 flex items-center gap-2">
+                <Smartphone className="w-4 h-4" /> 1. Gebruik als App op je Telefoon
+              </h4>
+              <p className="text-xs text-slate-300 leading-relaxed">
+                Je kunt deze webapp direct als icoontje op het startscherm van je telefoon zetten. Hij opent dan schermvullend als een echte app:
+              </p>
+              <div className="space-y-2 text-xs text-slate-300">
+                <div className="bg-slate-900 p-3 rounded-xl border border-slate-800">
+                  <strong className="text-white">🍏 iPhone / iPad (Safari):</strong> Tik onderaan op het <strong>Deel-icoontje</strong> (vierkantje met pijltje omhoog) en kies <strong>"Zet op beginscherm"</strong>.
+                </div>
+                <div className="bg-slate-900 p-3 rounded-xl border border-slate-800">
+                  <strong className="text-white">🤖 Android (Chrome):</strong> Tik rechtsboven op de <strong>3 puntjes (⋮)</strong> en kies <strong>"App installeren"</strong> of <strong>"Toevoegen aan startscherm"</strong>.
+                </div>
+              </div>
+            </div>
+
+            {/* OPTIE 2: DOWNLOAD JOUW DAGBOEK & GEGEVENS */}
+            <div className="bg-slate-950 border border-slate-800 rounded-2xl p-4 space-y-3">
+              <h4 className="text-sm font-bold text-sky-400 flex items-center gap-2">
+                <HardDriveDownload className="w-4 h-4" /> 2. Download jouw Dagboek & Back-up
+              </h4>
+              <p className="text-xs text-slate-400">
+                Download al je gelogde maaltijden, je persoonlijke profiel en recepten naar je apparaat:
+              </p>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                <button
+                  onClick={handleExportMealsCsv}
+                  className="bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/30 text-emerald-300 font-semibold text-xs py-3 px-3 rounded-xl flex items-center justify-center gap-2 transition"
+                >
+                  <FileSpreadsheet className="w-4 h-4" /> Download Excel (.CSV)
+                </button>
+                <button
+                  onClick={handleExportBackupJson}
+                  className="bg-sky-500/15 hover:bg-sky-500/25 border border-sky-500/30 text-sky-300 font-semibold text-xs py-3 px-3 rounded-xl flex items-center justify-center gap-2 transition"
+                >
+                  <Download className="w-4 h-4" /> Volledige Back-up (.JSON)
+                </button>
+              </div>
+
+              <div className="pt-2 border-t border-slate-800/80">
+                <label className="w-full bg-slate-900 hover:bg-slate-800 border border-dashed border-slate-700 text-slate-300 font-medium text-xs py-2.5 px-3 rounded-xl flex items-center justify-center gap-2 cursor-pointer transition">
+                  <Upload className="w-4 h-4 text-emerald-400" /> Bestaande Back-up (.JSON) Inladen
+                  <input
+                    type="file"
+                    accept=".json"
+                    onChange={handleImportBackupJson}
+                    className="hidden"
+                  />
+                </label>
+              </div>
+            </div>
+
+            <button
+              onClick={() => setShowInstallModal(false)}
+              className="w-full bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold py-3 rounded-2xl text-sm transition"
+            >
+              Sluiten
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* SLIMME LIVE MELDING BANNER (Op basis van dagritme) */}
+      {activeSmartPrompt && dismissedBannerId !== activeSmartPrompt.id && (
+        <div className="bg-gradient-to-r from-emerald-950/90 via-teal-950/90 to-slate-900 border-b border-emerald-500/30 px-4 py-3">
+          <div className="max-w-4xl mx-auto flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+            <div className="flex items-start gap-3">
+              <div className={`p-2 rounded-xl mt-0.5 shrink-0 ${
+                activeSmartPrompt.type === 'water' 
+                  ? 'bg-sky-500/20 text-sky-400 border border-sky-500/30' 
+                  : 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
+              }`}>
+                {activeSmartPrompt.type === 'water' ? <Droplets className="w-5 h-5" /> : <Bell className="w-5 h-5" />}
+              </div>
+              <div>
+                <div className="flex items-center gap-2">
+                  <span className="text-[11px] font-bold uppercase tracking-wider px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300">
+                    Slimme Herinnering • {activeSmartPrompt.time}
+                  </span>
+                  <h3 className="text-sm font-bold text-white">{activeSmartPrompt.title}</h3>
+                </div>
+                <p className="text-xs text-slate-300 mt-1 leading-relaxed">{activeSmartPrompt.advice}</p>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2 self-end sm:self-center shrink-0">
+              {activeSmartPrompt.type === 'water' ? (
+                <button
+                  onClick={() => handleAddWater(250, todayKey)}
+                  className="px-3 py-1.5 rounded-lg bg-sky-500 hover:bg-sky-400 text-slate-950 font-semibold text-xs flex items-center gap-1.5 shadow-md transition"
+                >
+                  <Plus className="w-3.5 h-3.5 stroke-[2.5]" /> Drink 250 ml
+                </button>
+              ) : (
+                <button
+                  onClick={() => setActiveTab('log')}
+                  className="px-3 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-semibold text-xs flex items-center gap-1.5 shadow-md transition"
+                >
+                  <Camera className="w-3.5 h-3.5" /> Nu Loggen
+                </button>
+              )}
+              <button
+                onClick={() => setDismissedBannerId(activeSmartPrompt.id)}
+                className="p-1.5 text-slate-400 hover:text-slate-200 rounded-lg"
+                title="Verbergen"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* TOAST MELDING */}
+      {toastMessage && (
+        <div className="fixed bottom-20 left-1/2 -translate-x-1/2 z-50 max-w-md w-[92%] pointer-events-none">
+          <div className={`px-4 py-3 rounded-2xl shadow-2xl border flex items-center gap-3 backdrop-blur-md ${
+            toastMessage.type === 'error' 
+              ? 'bg-rose-950/95 border-rose-500/50 text-rose-200' 
+              : 'bg-emerald-950/95 border-emerald-500/50 text-emerald-100'
+          }`}>
+            <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
+            <span className="text-sm font-medium">{toastMessage.text}</span>
+          </div>
+        </div>
+      )}
+
+      {/* HOOFDINHOUD */}
+      <main className="flex-1 max-w-4xl w-full mx-auto px-4 py-6">
+        {activeTab === 'dashboard' && (
+          <DashboardView
+            selectedDate={selectedDate}
+            setSelectedDate={setSelectedDate}
+            stats={selectedDateStats}
+            profile={profile}
+            meals={mealsForSelectedDate}
+            onAddWater={(amount) => handleAddWater(amount, selectedDate)}
+            onDeleteMeal={handleDeleteMeal}
+            onNavigate={setActiveTab}
+            smartSchedule={smartSchedule}
+          />
+        )}
+
+        {activeTab === 'log' && (
+          <LogMealView
+            selectedDate={selectedDate}
+            onSaveMeal={(meal) => {
+              handleSaveMeal(meal, selectedDate);
+              setActiveTab('dashboard');
+            }}
+            showToast={showToast}
+          />
+        )}
+
+        {activeTab === 'coach' && (
+          <LifestyleCoachView
+            profile={profile}
+            onSaveProfile={handleUpdateProfile}
+            todayStats={todayStats}
+            todayMeals={todayMeals}
+            smartSchedule={smartSchedule}
+            onAddWater={(amt) => handleAddWater(amt, todayKey)}
+            onQuickLogMeal={(meal) => handleSaveMeal(meal, todayKey)}
+            browserNotifPermission={browserNotifPermission}
+            onRequestNotif={requestNotificationPermission}
+            onNavigateProfile={() => setActiveTab('profile')}
+            showToast={showToast}
+          />
+        )}
+
+        {activeTab === 'profile' && (
+          <PersonalProfileCalculatorView
+            profile={profile}
+            onSaveProfile={(updated) => {
+              handleUpdateProfile(updated);
+            }}
+            onNavigateDashboard={() => setActiveTab('dashboard')}
+            onOpenDownloadModal={() => setShowInstallModal(true)}
+          />
+        )}
+
+        {activeTab === 'recipes' && (
+          <RecipesView
+            profile={profile}
+            todayStats={todayStats}
+            savedRecipes={savedRecipes}
+            onLogRecipe={(recipe) => {
+              handleSaveMeal({
+                mealName: recipe.title,
+                mealType: recipe.mealType || "Avondeten",
+                calories: recipe.calories,
+                protein: recipe.protein,
+                carbs: recipe.carbs,
+                fat: recipe.fat,
+                estimatedPortion: "1 portie (Recept)",
+                healthTip: recipe.shortDescription
+              }, selectedDate);
+            }}
+            onSaveFavorite={handleSaveRecipeToFavorites}
+            onDeleteFavorite={handleDeleteSavedRecipe}
+            showToast={showToast}
+          />
+        )}
+      </main>
+
+      {/* ONDERSTE MOBIELE NAVIGATIEBALK (5 TABS INCL. PROFIEL & KCAL CALCULATOR) */}
+      <nav className="fixed bottom-0 left-0 right-0 z-40 bg-slate-900/95 backdrop-blur-lg border-t border-slate-800 px-1.5 py-1.5">
+        <div className="max-w-xl mx-auto grid grid-cols-5 gap-1">
+          <button
+            onClick={() => setActiveTab('dashboard')}
+            className={`flex flex-col items-center justify-center py-2 rounded-xl transition ${
+              activeTab === 'dashboard'
+                ? 'text-emerald-400 bg-emerald-500/10 font-semibold'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Flame className="w-5 h-5 mb-0.5" />
+            <span className="text-[10px] sm:text-[11px]">Dagboek</span>
+          </button>
+
+          <button
+            onClick={() => setActiveTab('log')}
+            className={`flex flex-col items-center justify-center py-2 rounded-xl transition ${
+              activeTab === 'log'
+                ? 'text-emerald-400 bg-emerald-500/10 font-semibold'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Camera className="w-5 h-5 mb-0.5" />
+            <span className="text-[10px] sm:text-[11px]">Foto & Log</span>
+          </button>
+
+          <button
+            onClick={() => setActiveTab('coach')}
+            className={`flex flex-col items-center justify-center py-2 rounded-xl transition relative ${
+              activeTab === 'coach'
+                ? 'text-emerald-400 bg-emerald-500/10 font-semibold'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Clock className="w-5 h-5 mb-0.5" />
+            <span className="text-[10px] sm:text-[11px]">Advies & Ritme</span>
+            {activeSmartPrompt && (
+              <span className="absolute top-1.5 right-4 w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
+            )}
+          </button>
+
+          <button
+            onClick={() => setActiveTab('profile')}
+            className={`flex flex-col items-center justify-center py-2 rounded-xl transition ${
+              activeTab === 'profile'
+                ? 'text-emerald-400 bg-emerald-500/10 font-semibold'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <User className="w-5 h-5 mb-0.5" />
+            <span className="text-[10px] sm:text-[11px]">Mijn Kcal</span>
+          </button>
+
+          <button
+            onClick={() => setActiveTab('recipes')}
+            className={`flex flex-col items-center justify-center py-2 rounded-xl transition ${
+              activeTab === 'recipes'
+                ? 'text-emerald-400 bg-emerald-500/10 font-semibold'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <ChefHat className="w-5 h-5 mb-0.5" />
+            <span className="text-[10px] sm:text-[11px]">Recepten</span>
+          </button>
+        </div>
+      </nav>
+    </div>
+  );
+}
+
+// ==========================================
+// TAB 1: DASHBOARD & DAGELIJKSE SAMENVATTING
+// ==========================================
+function DashboardView({ selectedDate, setSelectedDate, stats, profile, meals, onAddWater, onDeleteMeal, onNavigate, smartSchedule }) {
+  const calPercent = Math.min(100, Math.round((stats.calories / (profile.calorieGoal || 2000)) * 100));
+  const remainingCals = Math.max(0, (profile.calorieGoal || 2000) - stats.calories);
+
+  const proteinPercent = Math.min(100, Math.round((stats.protein / (profile.proteinGoal || 140)) * 100));
+  const carbsPercent = Math.min(100, Math.round((stats.carbs / (profile.carbsGoal || 220)) * 100));
+  const fatPercent = Math.min(100, Math.round((stats.fat / (profile.fatGoal || 70)) * 100));
+  const waterPercent = Math.min(100, Math.round((stats.water / (profile.waterGoal || 2500)) * 100));
+
+  const mealCategories = ["Ontbijt", "Lunch", "Avondeten", "Tussendoortje"];
+
+  return (
+    <div className="space-y-6">
+      {/* BOVENSTE SAMENVATTINGSKAART */}
+      <div className="bg-slate-900 border border-slate-800 rounded-3xl p-5 sm:p-6 shadow-xl relative overflow-hidden">
+        <div className="absolute -right-12 -top-12 w-44 h-44 bg-emerald-500/10 rounded-full blur-3xl pointer-events-none" />
+        
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-5 border-b border-slate-800">
+          <div>
+            <span className="text-xs font-semibold uppercase tracking-wider text-emerald-400">
+              Samenvatting • {getDutchDateLabel(selectedDate)}
+            </span>
+            <h2 className="text-2xl font-bold text-white mt-0.5">Jouw Persoonlijke Balans</h2>
+            <div className="flex flex-wrap items-center gap-2 mt-1.5">
+              <span className="text-[11px] bg-slate-800 text-slate-300 px-2.5 py-0.5 rounded-full border border-slate-700">
+                {profile.gender === 'female' ? 'Vrouw' : 'Man'} • {profile.age}j • {profile.weight}kg • {profile.height}cm
+              </span>
+              <span className="text-[11px] bg-emerald-500/10 text-emerald-300 px-2.5 py-0.5 rounded-full border border-emerald-500/20">
+                {GOAL_TYPES[profile.goalType]?.label || 'Persoonlijk Doel'}
+              </span>
+              <button
+                onClick={() => onNavigate('profile')}
+                className="text-[11px] text-emerald-400 hover:underline font-semibold flex items-center gap-0.5"
+              >
+                Wijzig profiel <ArrowRight className="w-3 h-3" />
+              </button>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <input
+              type="date"
+              value={selectedDate}
+              onChange={(e) => e.target.value && setSelectedDate(e.target.value)}
+              className="bg-slate-800 border border-slate-700 text-slate-200 text-xs rounded-xl px-3 py-2 focus:outline-none focus:border-emerald-500"
+            />
+            <button
+              onClick={() => onNavigate('log')}
+              className="bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs sm:text-sm px-4 py-2 rounded-xl flex items-center gap-1.5 shadow-lg shadow-emerald-500/20 transition"
+            >
+              <Camera className="w-4 h-4" /> Scan of Voeg Toe
+            </button>
+          </div>
+        </div>
+
+        {/* CALORIE RING & MACRO BARS */}
+        <div className="grid grid-cols-1 md:grid-cols-12 gap-6 pt-5 items-center">
+          {/* Calorie Cirkel */}
+          <div className="md:col-span-5 flex items-center justify-center sm:justify-start gap-5 bg-slate-950/60 p-4 rounded-2xl border border-slate-800/80">
+            <div className="relative w-28 h-28 flex items-center justify-center shrink-0">
+              <svg className="w-full h-full -rotate-90" viewBox="0 0 100 100">
+                <circle
+                  cx="50"
+                  cy="50"
+                  r="42"
+                  className="stroke-slate-800"
+                  strokeWidth="10"
+                  fill="transparent"
+                />
+                <circle
+                  cx="50"
+                  cy="50"
+                  r="42"
+                  className="stroke-emerald-400 transition-all duration-700 ease-out"
+                  strokeWidth="10"
+                  strokeDasharray={264}
+                  strokeDashoffset={264 - (264 * calPercent) / 100}
+                  strokeLinecap="round"
+                  fill="transparent"
+                />
+              </svg>
+              <div className="absolute inset-0 flex flex-col items-center justify-center text-center">
+                <span className="text-xl font-extrabold text-white">{stats.calories}</span>
+                <span className="text-[10px] text-slate-400 uppercase">/ {profile.calorieGoal} kcal</span>
+              </div>
+            </div>
+
+            <div className="space-y-1.5">
+              <div className="text-xs text-slate-400">Resterend vandaag</div>
+              <div className="text-2xl font-black text-emerald-400">{remainingCals} <span className="text-sm font-normal">kcal</span></div>
+              <div className="text-xs text-slate-400 flex items-center gap-1">
+                <Flame className="w-3.5 h-3.5 text-amber-400" /> {calPercent}% van je dagdoel
+              </div>
+            </div>
+          </div>
+
+          {/* 3 Macro Voortgangsbalken */}
+          <div className="md:col-span-7 grid grid-cols-1 sm:grid-cols-3 gap-3">
+            {/* Eiwitten */}
+            <div className="bg-slate-950/60 p-3.5 rounded-2xl border border-slate-800/80">
+              <div className="flex items-center justify-between text-xs mb-1.5">
+                <span className="font-semibold text-rose-300 flex items-center gap-1">
+                  <Beef className="w-3.5 h-3.5 text-rose-400" /> Eiwitten
+                </span>
+                <span className="text-slate-400">{ proteinPercent }%</span>
+              </div>
+              <div className="text-lg font-bold text-white mb-2">
+                {stats.protein}g <span className="text-xs font-normal text-slate-400">/ {profile.proteinGoal}g</span>
+              </div>
+              <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
+                <div className="h-full bg-rose-500 rounded-full transition-all duration-500" style={{ width: `${proteinPercent}%` }} />
+              </div>
+            </div>
+
+            {/* Koolhydraten */}
+            <div className="bg-slate-950/60 p-3.5 rounded-2xl border border-slate-800/80">
+              <div className="flex items-center justify-between text-xs mb-1.5">
+                <span className="font-semibold text-amber-300 flex items-center gap-1">
+                  <Wheat className="w-3.5 h-3.5 text-amber-400" /> Koolhydr.
+                </span>
+                <span className="text-slate-400">{ carbsPercent }%</span>
+              </div>
+              <div className="text-lg font-bold text-white mb-2">
+                {stats.carbs}g <span className="text-xs font-normal text-slate-400">/ {profile.carbsGoal}g</span>
+              </div>
+              <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
+                <div className="h-full bg-amber-400 rounded-full transition-all duration-500" style={{ width: `${carbsPercent}%` }} />
+              </div>
+            </div>
+
+            {/* Vetten */}
+            <div className="bg-slate-950/60 p-3.5 rounded-2xl border border-slate-800/80">
+              <div className="flex items-center justify-between text-xs mb-1.5">
+                <span className="font-semibold text-violet-300 flex items-center gap-1">
+                  <Droplet className="w-3.5 h-3.5 text-violet-400" /> Vetten
+                </span>
+                <span className="text-slate-400">{ fatPercent }%</span>
+              </div>
+              <div className="text-lg font-bold text-white mb-2">
+                {stats.fat}g <span className="text-xs font-normal text-slate-400">/ {profile.fatGoal}g</span>
+              </div>
+              <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
+                <div className="h-full bg-violet-400 rounded-full transition-all duration-500" style={{ width: `${fatPercent}%` }} />
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* WATER TRACKER & SNELKEUZE */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        {/* Water Tracker */}
+        <div className="bg-slate-900 border border-slate-800 rounded-3xl p-5 flex flex-col justify-between">
+          <div>
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2.5">
+                <div className="p-2.5 rounded-xl bg-sky-500/15 text-sky-400">
+                  <Droplets className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-white text-sm">Waterinname & Hydratatie</h3>
+                  <p className="text-xs text-slate-400">
+                    {Math.round(stats.water / 250)} van de {Math.round(profile.waterGoal / 250)} glazen gedronken
+                  </p>
+                </div>
+              </div>
+              <div className="text-right">
+                <span className="text-lg font-extrabold text-sky-400">{stats.water}</span>
+                <span className="text-xs text-slate-400"> / {profile.waterGoal} ml</span>
+              </div>
+            </div>
+
+            <div className="w-full h-2.5 bg-slate-800 rounded-full overflow-hidden my-4">
+              <div 
+                className="h-full bg-gradient-to-r from-sky-500 to-cyan-400 rounded-full transition-all duration-500"
+                style={{ width: `${waterPercent}%` }}
+              />
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2 pt-1">
+            <button
+              onClick={() => onAddWater(250)}
+              className="flex-1 bg-sky-500/20 hover:bg-sky-500/30 border border-sky-500/40 text-sky-300 font-semibold text-xs py-2.5 px-3 rounded-xl flex items-center justify-center gap-1.5 transition"
+            >
+              <Plus className="w-4 h-4" /> +1 Glas (250ml)
+            </button>
+            <button
+              onClick={() => onAddWater(500)}
+              className="flex-1 bg-sky-500/20 hover:bg-sky-500/30 border border-sky-500/40 text-sky-300 font-semibold text-xs py-2.5 px-3 rounded-xl flex items-center justify-center gap-1.5 transition"
+            >
+              <Plus className="w-4 h-4" /> +Bidon (500ml)
+            </button>
+            {stats.water > 0 && (
+              <button
+                onClick={() => onAddWater(-250)}
+                className="p-2.5 bg-slate-800 hover:bg-slate-700 text-slate-400 rounded-xl text-xs transition"
+                title="-250ml corrigeren"
+              >
+                -250
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Slimme Leefstijl & Eetmoment Widget */}
+        <div className="bg-slate-900 border border-slate-800 rounded-3xl p-5 flex flex-col justify-between">
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex items-center gap-2.5">
+              <div className="p-2.5 rounded-xl bg-emerald-500/15 text-emerald-400">
+                <Clock className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="font-bold text-white text-sm">Jouw Ritme & Eetmomenten</h3>
+                <p className="text-xs text-slate-400">{profile.lifestyleType} • Opstaan {profile.wakeTime}</p>
+              </div>
+            </div>
+            <button
+              onClick={() => onNavigate('coach')}
+              className="text-xs text-emerald-400 hover:underline flex items-center gap-1 font-medium"
+            >
+              Schema <ArrowRight className="w-3.5 h-3.5" />
+            </button>
+          </div>
+
+          <div className="my-3 space-y-2">
+            {smartSchedule.slice(0, 3).map((item) => (
+              <div key={item.id} className="flex items-center justify-between text-xs bg-slate-950/60 px-3 py-2 rounded-xl border border-slate-800/60">
+                <div className="flex items-center gap-2">
+                  <span className="font-mono font-bold text-emerald-400">{item.time}</span>
+                  <span className="text-slate-200 font-medium">{item.title}</span>
+                </div>
+                {item.completed ? (
+                  <span className="text-emerald-400 flex items-center gap-1 text-[11px]">
+                    <Check className="w-3.5 h-3.5" /> Voltooid
+                  </span>
+                ) : (
+                  <span className="text-slate-500 text-[11px]">Gepland</span>
+                )}
+              </div>
+            ))}
+          </div>
+
+          <button
+            onClick={() => onNavigate('coach')}
+            className="w-full bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold text-xs py-2.5 px-3 rounded-xl flex items-center justify-center gap-2 transition"
+          >
+            <Sparkles className="w-4 h-4 text-emerald-400" /> Vraag AI Coach: Wat kan ik nu het beste eten?
+          </button>
+        </div>
+      </div>
+
+      {/* MAALTIJDEN VAN DE GESELECTEERDE DAG PER CATEGORIE */}
+      <div className="space-y-4">
+        <div className="flex items-center justify-between">
+          <h3 className="text-lg font-bold text-white flex items-center gap-2">
+            <Utensils className="w-5 h-5 text-emerald-400" />
+            Maaltijdoverzicht ({meals.length} items)
+          </h3>
+          <button
+            onClick={() => onNavigate('log')}
+            className="text-xs font-semibold text-emerald-400 hover:text-emerald-300 flex items-center gap-1"
+          >
+            <Plus className="w-4 h-4" /> Maaltijd toevoegen
+          </button>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          {mealCategories.map((category) => {
+            const items = meals.filter(m => m.mealType === category);
+            const categoryCals = items.reduce((sum, i) => sum + (Number(i.calories) || 0), 0);
+
+            return (
+              <div key={category} className="bg-slate-900 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between">
+                <div>
+                  <div className="flex items-center justify-between pb-3 mb-3 border-b border-slate-800">
+                    <div className="flex items-center gap-2">
+                      <span className="w-2.5 h-2.5 rounded-full bg-emerald-400" />
+                      <h4 className="font-bold text-white text-sm">{category}</h4>
+                    </div>
+                    <span className="text-xs font-semibold text-slate-400">{categoryCals} kcal</span>
+                  </div>
+
+                  {items.length === 0 ? (
+                    <div className="py-6 text-center">
+                      <p className="text-xs text-slate-500">Nog niets gelogd voor {category.toLowerCase()}</p>
+                    </div>
+                  ) : (
+                    <div className="space-y-2.5">
+                      {items.map((item) => (
+                        <div key={item.id} className="bg-slate-950/70 border border-slate-800/80 rounded-xl p-3 flex items-start justify-between gap-2">
+                          <div className="space-y-1">
+                            <div className="flex items-center gap-2">
+                              <span className="text-[11px] font-mono text-slate-400">{item.time}</span>
+                              <h5 className="text-sm font-semibold text-white">{item.mealName}</h5>
+                            </div>
+                            <p className="text-[11px] text-slate-400">{item.estimatedPortion}</p>
+                            <div className="flex flex-wrap items-center gap-2 pt-1 text-[11px]">
+                              <span className="px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-300 font-semibold">
+                                {item.calories} kcal
+                              </span>
+                              <span className="text-rose-300">E: {item.protein}g</span>
+                              <span className="text-amber-300">K: {item.carbs}g</span>
+                              <span className="text-violet-300">V: {item.fat}g</span>
+                            </div>
+                            {item.healthTip && (
+                              <p className="text-[11px] text-emerald-400/90 italic pt-1">
+                                💡 {item.healthTip}
+                              </p>
+                            )}
+                          </div>
+                          <button
+                            onClick={() => onDeleteMeal(item.id)}
+                            className="p-1.5 text-slate-500 hover:text-rose-400 rounded-lg transition shrink-0"
+                            title="Verwijder item"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <button
+                  onClick={() => onNavigate('log')}
+                  className="mt-3 w-full py-2 rounded-xl border border-dashed border-slate-700 hover:border-emerald-500/50 text-xs text-slate-400 hover:text-emerald-300 flex items-center justify-center gap-1 transition"
+                >
+                  <Plus className="w-3.5 h-3.5" /> {category} toevoegen
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ==========================================
+// TAB 2: AI FOTO SCANNER & HANDMATIG LOGGEN
+// ==========================================
+function LogMealView({ selectedDate, onSaveMeal, showToast }) {
+  const [mode, setMode] = useState('photo'); // 'photo' | 'ai-text' | 'manual'
+  
+  // Foto Scanner State
+  const [imagePreview, setImagePreview] = useState(null);
+  const [imageBase64, setImageBase64] = useState(null);
+  const [imageMimeType, setImageMimeType] = useState("image/jpeg");
+  const [photoNote, setPhotoNote] = useState("");
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [analysisResult, setAnalysisResult] = useState(null);
+  const fileInputRef = useRef(null);
+
+  // AI Tekst State
+  const [textQuery, setTextQuery] = useState("");
+
+  // Handmatig Formulier State (ook gebruikt om AI resultaat bij te stellen voor opslaan)
+  const [formState, setFormState] = useState({
+    mealName: "",
+    mealType: "Lunch",
+    estimatedPortion: "1 portie",
+    calories: "",
+    protein: "",
+    carbs: "",
+    fat: "",
+    healthTip: ""
+  });
+
+  // Verwerk gekozen of gemaakte foto
+  const handleFileChange = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const dataUrl = event.target.result;
+      setImagePreview(dataUrl);
+      const [header, base64] = dataUrl.split(',');
+      const mimeMatch = header.match(/data:(.*);base64/);
+      setImageMimeType(mimeMatch ? mimeMatch[1] : file.type || "image/jpeg");
+      setImageBase64(base64);
+      setAnalysisResult(null);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleRunPhotoAnalysis = async () => {
+    if (!imageBase64) return;
+    setIsAnalyzing(true);
+    try {
+      const result = await analyzeMealImageWithGemini(imageBase64, imageMimeType, photoNote);
+      setAnalysisResult(result);
+      setFormState({
+        mealName: result.mealName || "Gescande Maaltijd",
+        mealType: ["Ontbijt", "Lunch", "Avondeten", "Tussendoortje"].includes(result.suggestedMealType) 
+          ? result.suggestedMealType 
+          : "Lunch",
+        estimatedPortion: result.estimatedPortion || "1 bord",
+        calories: result.calories || 0,
+        protein: result.protein || 0,
+        carbs: result.carbs || 0,
+        fat: result.fat || 0,
+        healthTip: result.healthTip || ""
+      });
+      showToast("Foto succesvol geanalyseerd door AI! ✨");
+    } catch (err) {
+      console.error(err);
+      showToast("Kon de foto niet analyseren. Probeer het opnieuw of vul handmatig in.", "error");
+    } finally {
+      setIsAnalyzing(false);
+    }
+  };
+
+  const handleRunTextAnalysis = async () => {
+    if (!textQuery.trim()) return;
+    setIsAnalyzing(true);
+    try {
+      const result = await analyzeMealTextWithGemini(textQuery);
+      setAnalysisResult(result);
+      setFormState({
+        mealName: result.mealName || textQuery,
+        mealType: ["Ontbijt", "Lunch", "Avondeten", "Tussendoortje"].includes(result.suggestedMealType) 
+          ? result.suggestedMealType 
+          : "Lunch",
+        estimatedPortion: result.estimatedPortion || "1 portie",
+        calories: result.calories || 0,
+        protein: result.protein || 0,
+        carbs: result.carbs || 0,
+        fat: result.fat || 0,
+        healthTip: result.healthTip || ""
+      });
+      showToast("Voedingswaarde berekend!");
+    } catch (err) {
+      console.error(err);
+      showToast("Kon tekst niet berekenen. Probeer het nog eens.", "error");
+    } finally {
+      setIsAnalyzing(false);
+    }
+  };
+
+  const handleSubmitForm = (e) => {
+    e.preventDefault();
+    if (!formState.mealName) {
+      showToast("Vul een naam in voor de maaltijd.", "error");
+      return;
+    }
+    onSaveMeal(formState);
+  };
+
+  return (
+    <div className="space-y-6">
+      {/* KEUZE TABS: FOTO SCANNER / AI TEKST / HANDMATIG */}
+      <div className="bg-slate-900 border border-slate-800 p-1.5 rounded-2xl grid grid-cols-3 gap-1.5">
+        <button
+          onClick={() => setMode('photo')}
+          className={`py-2.5 px-3 rounded-xl text-xs sm:text-sm font-semibold flex items-center justify-center gap-2 transition ${
+            mode === 'photo'
+              ? 'bg-emerald-500 text-slate-950 shadow-md'
+              : 'text-slate-300 hover:bg-slate-800'
+          }`}
+        >
+          <Camera className="w-4 h-4" /> AI Foto Scanner
+        </button>
+        <button
+          onClick={() => setMode('ai-text')}
+          className={`py-2.5 px-3 rounded-xl text-xs sm:text-sm font-semibold flex items-center justify-center gap-2 transition ${
+            mode === 'ai-text'
+              ? 'bg-emerald-500 text-slate-950 shadow-md'
+              : 'text-slate-300 hover:bg-slate-800'
+          }`}
+        >
+          <Sparkles className="w-4 h-4" /> Typ & Bereken
+        </button>
+        <button
+          onClick={() => setMode('manual')}
+          className={`py-2.5 px-3 rounded-xl text-xs sm:text-sm font-semibold flex items-center justify-center gap-2 transition ${
+            mode === 'manual'
+              ? 'bg-emerald-500 text-slate-950 shadow-md'
+              : 'text-slate-300 hover:bg-slate-800'
+          }`}
+        >
+          <Edit3 className="w-4 h-4" /> Handmatig
+        </button>
+      </div>
+
+      {/* MODUS 1: AI FOTO SCANNER */}
+      {mode === 'photo' && (
+        <div className="bg-slate-900 border border-slate-800 rounded-3xl p-5 sm:p-6 space-y-5">
+          <div>
+            <h2 className="text-xl font-bold text-white flex items-center gap-2">
+              <Camera className="w-5 h-5 text-emerald-400" /> Maak een foto van je bord
+            </h2>
+            <p className="text-xs sm:text-sm text-slate-400 mt-1">
+              Onze AI herkent de ingrediënten op je foto en schat direct de calorieën, eiwitten, koolhydraten en vetten in.
+            </p>
+          </div>
+
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            capture="environment"
+            onChange={handleFileChange}
+            className="hidden"
+          />
+
+          {!imagePreview ? (
+            <div 
+              onClick={() => fileInputRef.current?.click()}
+              className="border-2 border-dashed border-emerald-500/40 hover:border-emerald-400 bg-slate-950/60 hover:bg-slate-950 rounded-3xl p-8 text-center cursor-pointer transition group"
+            >
+              <div className="w-16 h-16 rounded-2xl bg-emerald-500/15 text-emerald-400 flex items-center justify-center mx-auto mb-4 group-hover:scale-105 transition">
+                <Camera className="w-8 h-8" />
+              </div>
+              <h3 className="font-bold text-white text-base">Tik om een foto te maken of te uploaden</h3>
+              <p className="text-xs text-slate-400 mt-1 max-w-sm mx-auto">
+                Werkt direct met je telefooncamera of kies een maaltijdfoto uit je galerij.
+              </p>
+            </div>
+          ) : (
+            <div className="space-y-4">
+              <div className="relative rounded-2xl overflow-hidden border border-slate-700 max-h-72 bg-slate-950 flex items-center justify-center">
+                <img src={imagePreview} alt="Maaltijd preview" className="max-h-72 w-auto object-contain" />
+                <button
+                  onClick={() => {
+                    setImagePreview(null);
+                    setImageBase64(null);
+                    setAnalysisResult(null);
+                  }}
+                  className="absolute top-3 right-3 bg-slate-900/90 hover:bg-rose-600 text-white p-2 rounded-xl text-xs flex items-center gap-1 shadow-lg transition"
+                >
+                  <X className="w-4 h-4" /> Andere foto
+                </button>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-300 mb-1">
+                  Optionele toelichting (bijv. "gebakken in olijfolie" of "volkoren pasta"):
+                </label>
+                <input
+                  type="text"
+                  value={photoNote}
+                  onChange={(e) => setPhotoNote(e.target.value)}
+                  placeholder="Typ eventuele extra details..."
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-sm text-white focus:outline-none focus:border-emerald-500"
+                />
+              </div>
+
+              <button
+                onClick={handleRunPhotoAnalysis}
+                disabled={isAnalyzing}
+                className="w-full bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 disabled:opacity-50 text-slate-950 font-bold py-3.5 px-6 rounded-2xl flex items-center justify-center gap-2 shadow-lg shadow-emerald-500/20 transition"
+              >
+                {isAnalyzing ? (
+                  <>
+                    <RefreshCw className="w-5 h-5 animate-spin" /> AI analyseert je maaltijd...
+                  </>
+                ) : (
+                  <>
+                    <Sparkles className="w-5 h-5" /> Analyseer Calorieën & Macro's
+                  </>
+                )}
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* MODUS 2: AI TEKST ZOEKEN */}
+      {mode === 'ai-text' && (
+        <div className="bg-slate-900 border border-slate-800 rounded-3xl p-5 sm:p-6 space-y-4">
+          <div>
+            <h2 className="text-xl font-bold text-white flex items-center gap-2">
+              <Sparkles className="w-5 h-5 text-emerald-400" /> Vertel wat je hebt gegeten
+            </h2>
+            <p className="text-xs sm:text-sm text-slate-400 mt-1">
+              Omschrijf je maaltijd in gewone taal en laat de AI alle voedingswaarden voor je opzoeken.
+            </p>
+          </div>
+
+          <textarea
+            rows={3}
+            value={textQuery}
+            onChange={(e) => setTextQuery(e.target.value)}
+            placeholder="Bijv: 2 volkoren boterhammen met 100% pindakaas, een banaan en een cappuccino met havermelk..."
+            className="w-full bg-slate-950 border border-slate-800 rounded-2xl p-4 text-sm text-white focus:outline-none focus:border-emerald-500"
+          />
+
+          <div className="flex flex-wrap gap-2">
+            {[
+              "2 gekookte eieren op volkoren brood",
+              "Schaaltje magere kwark (250g) met handje walnoten",
+              "Portie kip kerrie met rijst en broccoli"
+            ].map((sample) => (
+              <button
+                key={sample}
+                onClick={() => setTextQuery(sample)}
+                className="text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 px-3 py-1.5 rounded-xl transition"
+              >
+                + "{sample}"
+              </button>
+            ))}
+          </div>
+
+          <button
+            onClick={handleRunTextAnalysis}
+            disabled={isAnalyzing || !textQuery.trim()}
+            className="w-full bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-bold py-3.5 px-6 rounded-2xl flex items-center justify-center gap-2 shadow-lg transition"
+          >
+            {isAnalyzing ? (
+              <>
+                <RefreshCw className="w-5 h-5 animate-spin" /> Voedingswaarden berekenen...
+              </>
+            ) : (
+              <>
+                <Sparkles className="w-5 h-5" /> Bereken Voedingswaarde
+              </>
+            )}
+          </button>
+        </div>
+      )}
+
+      {/* AI GEDETECTEERDE INGREDIENTEN OVERZICHT */}
+      {analysisResult && (mode === 'photo' || mode === 'ai-text') && (
+        <div className="bg-emerald-950/30 border border-emerald-500/40 rounded-3xl p-5 space-y-3">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-bold uppercase tracking-wider text-emerald-400 flex items-center gap-1.5">
+              <CheckCircle2 className="w-4 h-4" /> AI Analyse Resultaat
+            </span>
+            <span className="text-xs text-slate-400">{analysisResult.estimatedPortion}</span>
+          </div>
+          <h3 className="text-lg font-bold text-white">{analysisResult.mealName}</h3>
+          
+          {analysisResult.detectedItems?.length > 0 && (
+            <div className="flex flex-wrap gap-1.5">
+              {analysisResult.detectedItems.map((item, idx) => (
+                <span key={idx} className="text-xs bg-slate-900/90 border border-slate-700 text-slate-200 px-2.5 py-1 rounded-lg">
+                  • {item}
+                </span>
+              ))}
+            </div>
+          )}
+
+          {analysisResult.healthTip && (
+            <p className="text-xs text-emerald-300 bg-emerald-500/10 p-3 rounded-xl border border-emerald-500/20">
+              💡 <strong>Coach Tip:</strong> {analysisResult.healthTip}
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* BEWERK & OPSLAAN FORMULIER (Altijd zichtbaar in 'manual' of na een AI-analyse) */}
+      {(mode === 'manual' || analysisResult) && (
+        <form onSubmit={handleSubmitForm} className="bg-slate-900 border border-slate-800 rounded-3xl p-5 sm:p-6 space-y-4">
+          <h3 className="font-bold text-white text-base flex items-center gap-2">
+            <Utensils className="w-4 h-4 text-emerald-400" />
+            {analysisResult ? "Controleer & Sla op in Dagboek" : "Handmatig Maaltijd Toevoegen"}
+          </h3>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-xs text-slate-400 mb-1">Naam van maaltijd / product</label>
+              <input
+                type="text"
+                required
+                value={formState.mealName}
+                onChange={(e) => setFormState({ ...formState, mealName: e.target.value })}
+                placeholder="Bijv. Havermout met banaan"
+                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-sm text-white focus:outline-none focus:border-emerald-500"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs text-slate-400 mb-1">Maaltijdtype</label>
+              <select
+                value={formState.mealType}
+                onChange={(e) => setFormState({ ...formState, mealType: e.target.value })}
+                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-sm text-white focus:outline-none focus:border-emerald-500"
+              >
+                <option value="Ontbijt">Ontbijt</option>
+                <option value="Lunch">Lunch</option>
+                <option value="Avondeten">Avondeten</option>
+                <option value="Tussendoortje">Tussendoortje</option>
+              </select>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            <div>
+              <label className="block text-xs text-emerald-400 font-semibold mb-1">Calorieën (kcal)</label>
+              <input
+                type="number"
+                required
+                value={formState.calories}
+                onChange={(e) => setFormState({ ...formState, calories: e.target.value })}
+                placeholder="450"
+                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-sm text-white font-bold focus:outline-none focus:border-emerald-500"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs text-rose-400 font-semibold mb-1">Eiwitten (g)</label>
+              <input
+                type="number"
+                value={formState.protein}
+                onChange={(e) => setFormState({ ...formState, protein: e.target.value })}
+                placeholder="25"
+                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-sm text-white focus:outline-none focus:border-emerald-500"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs text-amber-400 font-semibold mb-1">Koolhydr. (g)</label>
+              <input
+                type="number"
+                value={formState.carbs}
+                onChange={(e) => setFormState({ ...formState, carbs: e.target.value })}
+                placeholder="45"
+                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-sm text-white focus:outline-none focus:border-emerald-500"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs text-violet-400 font-semibold mb-1">Vetten (g)</label>
+              <input
+                type="number"
+                value={formState.fat}
+                onChange={(e) => setFormState({ ...formState, fat: e.target.value })}
+                placeholder="15"
+                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-sm text-white focus:outline-none focus:border-emerald-500"
+              />
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-xs text-slate-400 mb-1">Portiegrootte</label>
+            <input
+              type="text"
+              value={formState.estimatedPortion}
+              onChange={(e) => setFormState({ ...formState, estimatedPortion: e.target.value })}
+              placeholder="Bijv. 1 kom (300g)"
+              className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2 text-sm text-white focus:outline-none focus:border-emerald-500"
+            />
+          </div>
+
+          <button
+            type="submit"
+            className="w-full bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold py-3.5 px-6 rounded-2xl flex items-center justify-center gap-2 shadow-lg shadow-emerald-500/20 transition"
+          >
+            <CheckCircle2 className="w-5 h-5" /> Toevoegen aan {getDutchDateLabel(selectedDate)}
+          </button>
+        </form>
+      )}
+    </div>
+  );
+}
+
+// ==========================================
+// TAB 3: LEEFSTIJL COACH, DAGRITME & MELDINGEN
+// ==========================================
+function LifestyleCoachView({
+  profile,
+  onSaveProfile,
+  todayStats,
+  todayMeals,
+  smartSchedule,
+  onAddWater,
+  onQuickLogMeal,
+  browserNotifPermission,
+  onRequestNotif,
+  onNavigateProfile,
+  showToast
+}) {
+  const [editProfile, setEditProfile] = useState(profile);
+  const [showSettings, setShowSettings] = useState(false);
+  const [aiAdvice, setAiAdvice] = useState(null);
+  const [loadingAdvice, setLoadingAdvice] = useState(false);
+
+  useEffect(() => {
+    setEditProfile(profile);
+  }, [profile]);
+
+  const handleAskLiveCoach = async () => {
+    setLoadingAdvice(true);
+    try {
+      const now = new Date();
+      const timeStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+      const result = await getLiveCoachAdvice(profile, todayStats, todayMeals, timeStr);
+      setAiAdvice(result);
+    } catch (err) {
+      console.error(err);
+      showToast("Kon AI Coach advies even niet ophalen.", "error");
+    } finally {
+      setLoadingAdvice(false);
+    }
+  };
+
+  const handleSaveSettings = (e) => {
+    e.preventDefault();
+    onSaveProfile({
+      ...profile,
+      wakeTime: editProfile.wakeTime,
+      sleepTime: editProfile.sleepTime,
+      lifestyleType: editProfile.lifestyleType,
+      workoutTime: editProfile.workoutTime
+    });
+    setShowSettings(false);
+  };
+
+  return (
+    <div className="space-y-6">
+      {/* LIVE AI COACH ADVIES KAART */}
+      <div className="bg-gradient-to-br from-emerald-950/80 via-slate-900 to-slate-900 border border-emerald-500/30 rounded-3xl p-5 sm:p-6 shadow-xl">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <div className="space-y-1">
+            <span className="text-xs font-bold uppercase tracking-wider text-emerald-400 flex items-center gap-1.5">
+              <Sparkles className="w-4 h-4" /> Persoonlijke AI Leefstijl Coach
+            </span>
+            <h2 className="text-xl sm:text-2xl font-bold text-white">
+              Wat en wanneer kan ik nu het beste eten?
+            </h2>
+            <p className="text-xs sm:text-sm text-slate-300">
+              Afgestemd op jouw profiel ({profile.gender === 'female' ? 'Vrouw' : 'Man'}, {profile.age}j, {profile.weight}kg), jouw werk ({WORK_ACTIVITY_LEVELS[profile.workActivity]?.label || profile.lifestyleType}) en je resterende macro's.
+            </p>
+          </div>
+
+          <button
+            onClick={handleAskLiveCoach}
+            disabled={loadingAdvice}
+            className="bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-bold text-xs sm:text-sm px-5 py-3 rounded-2xl flex items-center justify-center gap-2 shrink-0 shadow-lg shadow-emerald-500/20 transition"
+          >
+            {loadingAdvice ? (
+              <>
+                <RefreshCw className="w-4 h-4 animate-spin" /> Coach denkt na...
+              </>
+            ) : (
+              <>
+                <Sparkles className="w-4 h-4" /> Geef Mij Nu Advies
+              </>
+            )}
+          </button>
+        </div>
+
+        {/* AI ADVIES RESULTAAT */}
+        {aiAdvice && (
+          <div className="mt-5 pt-5 border-t border-emerald-500/20 space-y-4">
+            <div className="bg-slate-950/80 border border-emerald-500/30 rounded-2xl p-4 space-y-2">
+              <h3 className="font-bold text-emerald-300 text-base">{aiAdvice.headline}</h3>
+              <p className="text-sm text-slate-200 leading-relaxed">{aiAdvice.rightNowAction}</p>
+              <div className="flex flex-wrap items-center gap-3 pt-2 text-xs text-slate-300">
+                <span className="bg-emerald-500/15 text-emerald-300 px-3 py-1 rounded-lg font-medium flex items-center gap-1.5">
+                  <Clock className="w-3.5 h-3.5" /> {aiAdvice.nextMealTiming}
+                </span>
+                <span className="bg-sky-500/15 text-sky-300 px-3 py-1 rounded-lg font-medium flex items-center gap-1.5">
+                  <Droplets className="w-3.5 h-3.5" /> {aiAdvice.hydrationAdvice}
+                </span>
+              </div>
+            </div>
+
+            {aiAdvice.concreteSuggestions?.length > 0 && (
+              <div>
+                <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2.5">
+                  Aanbevolen voor dit moment (1-klik toevoegen):
+                </h4>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  {aiAdvice.concreteSuggestions.map((sug, idx) => (
+                    <div key={idx} className="bg-slate-950/70 border border-slate-800 rounded-2xl p-3.5 flex flex-col justify-between">
+                      <div>
+                        <h5 className="font-bold text-white text-sm">{sug.title}</h5>
+                        <p className="text-xs text-slate-400 mt-1">{sug.why}</p>
+                      </div>
+                      <div className="mt-3 pt-2.5 border-t border-slate-800/80 flex items-center justify-between">
+                        <div className="text-xs">
+                          <span className="text-emerald-400 font-bold">{sug.calories} kcal</span>
+                          <span className="text-slate-400"> • {sug.protein}g E</span>
+                        </div>
+                        <button
+                          onClick={() => onQuickLogMeal({
+                            mealName: sug.title,
+                            mealType: "Tussendoortje",
+                            calories: sug.calories,
+                            protein: sug.protein,
+                            carbs: Math.round((sug.calories - sug.protein * 4) / 8),
+                            fat: Math.round((sug.calories - sug.protein * 4) / 18),
+                            estimatedPortion: "1 coach-portie"
+                          })}
+                          className="text-xs bg-emerald-500/20 hover:bg-emerald-500 text-emerald-300 hover:text-slate-950 font-semibold px-2.5 py-1 rounded-lg transition"
+                        >
+                          + Log
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* DAGRITME INSTELLINGEN & MELDINGEN */}
+      <div className="bg-slate-900 border border-slate-800 rounded-3xl p-5 sm:p-6">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-slate-800">
+          <div>
+            <h3 className="text-lg font-bold text-white flex items-center gap-2">
+              <Bell className="w-5 h-5 text-emerald-400" />
+              Slim Tijdschema & Eet/Drink Meldingen
+            </h3>
+            <p className="text-xs text-slate-400 mt-0.5">
+              Jouw schema berekent automatisch wanneer je lichaam water, brandstof of eiwitten nodig heeft.
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            {browserNotifPermission !== 'granted' && (
+              <button
+                onClick={onRequestNotif}
+                className="bg-slate-800 hover:bg-slate-700 text-emerald-400 border border-emerald-500/30 text-xs font-semibold px-3 py-2 rounded-xl flex items-center gap-1.5 transition"
+              >
+                <Bell className="w-3.5 h-3.5" /> Meldingen Activeren
+              </button>
+            )}
+            <button
+              onClick={() => setShowSettings(!showSettings)}
+              className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold px-3.5 py-2 rounded-xl flex items-center gap-1.5 transition"
+            >
+              <Clock className="w-3.5 h-3.5 text-emerald-400" /> {showSettings ? "Sluit Tijden" : "Wijzig Tijden"}
+            </button>
+            <button
+              onClick={onNavigateProfile}
+              className="bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 text-xs font-semibold px-3.5 py-2 rounded-xl flex items-center gap-1.5 transition"
+            >
+              <User className="w-3.5 h-3.5" /> Mijn Kcal & Profiel
+            </button>
+          </div>
+        </div>
+
+        {/* UITKLAPBAAR FORMULIER VOOR SLAAP & SPORTTIJDEN */}
+        {showSettings && (
+          <form onSubmit={handleSaveSettings} className="my-5 bg-slate-950 border border-slate-800 rounded-2xl p-4 sm:p-5 space-y-4">
+            <h4 className="font-bold text-white text-sm">Pas jouw dagelijkse tijden aan</h4>
+            
+            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3">
+              <div>
+                <label className="block text-xs text-slate-400 mb-1">Hoe laat sta je op?</label>
+                <input
+                  type="time"
+                  value={editProfile.wakeTime}
+                  onChange={(e) => setEditProfile({ ...editProfile, wakeTime: e.target.value })}
+                  className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs text-slate-400 mb-1">Hoe laat ga je slapen?</label>
+                <input
+                  type="time"
+                  value={editProfile.sleepTime}
+                  onChange={(e) => setEditProfile({ ...editProfile, sleepTime: e.target.value })}
+                  className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs text-slate-400 mb-1">Type dagindeling</label>
+                <select
+                  value={editProfile.lifestyleType}
+                  onChange={(e) => setEditProfile({ ...editProfile, lifestyleType: e.target.value })}
+                  className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white"
+                >
+                  <option value="Kantoorbaan + Avondsport">Kantoorbaan + Avondsport</option>
+                  <option value="Thuiswerk / Rustige dag">Thuiswerk / Rustige dag</option>
+                  <option value="Fysiek werk / Veel onderweg">Fysiek werk / Veel onderweg</option>
+                  <option value="Ochtendsporter">Ochtendsporter</option>
+                  <option value="Onregelmatige diensten">Onregelmatige diensten</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-xs text-slate-400 mb-1">Sporttijd vandaag (optioneel)</label>
+                <input
+                  type="time"
+                  value={editProfile.workoutTime}
+                  onChange={(e) => setEditProfile({ ...editProfile, workoutTime: e.target.value })}
+                  className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white"
+                />
+              </div>
+            </div>
+
+            <button
+              type="submit"
+              className="w-full bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold py-2.5 rounded-xl text-sm transition"
+            >
+              Dagritme Opslaan
+            </button>
+          </form>
+        )}
+
+        {/* TIJDLIJN VAN DE DAG */}
+        <div className="mt-5 space-y-3">
+          {smartSchedule.map((item) => (
+            <div
+              key={item.id}
+              className={`p-4 rounded-2xl border transition flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
+                item.completed
+                  ? 'bg-slate-950/40 border-slate-800/60 opacity-75'
+                  : 'bg-slate-950 border-slate-800 hover:border-emerald-500/40'
+              }`}
+            >
+              <div className="flex items-start gap-3.5">
+                <div className={`px-2.5 py-1.5 rounded-xl font-mono text-xs font-bold shrink-0 ${
+                  item.completed
+                    ? 'bg-emerald-500/15 text-emerald-400'
+                    : item.type === 'water'
+                    ? 'bg-sky-500/15 text-sky-400'
+                    : 'bg-amber-500/15 text-amber-400'
+                }`}>
+                  {item.time}
+                </div>
+                <div>
+                  <div className="flex items-center gap-2">
+                    <h4 className="font-bold text-white text-sm">{item.title}</h4>
+                    {item.completed && (
+                      <span className="text-[11px] bg-emerald-500/20 text-emerald-300 px-2 py-0.5 rounded-full font-semibold flex items-center gap-1">
+                        <Check className="w-3 h-3" /> Afgevinkt
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-xs text-slate-400 mt-1 leading-relaxed">{item.advice}</p>
+                </div>
+              </div>
+
+              {!item.completed && item.type === 'water' && (
+                <button
+                  onClick={() => onAddWater(250)}
+                  className="self-end sm:self-center shrink-0 bg-sky-500/20 hover:bg-sky-500 text-sky-300 hover:text-slate-950 text-xs font-semibold px-3 py-2 rounded-xl transition flex items-center gap-1"
+                >
+                  <Plus className="w-3.5 h-3.5" /> +250ml gedronken
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ==========================================
+// NIEUW TABBLAD: PERSOONLIJKE BMR, TDEE & MACRO CALCULATOR
+// ==========================================
+function PersonalProfileCalculatorView({ profile, onSaveProfile, onNavigateDashboard, onOpenDownloadModal }) {
+  const [form, setForm] = useState(() => ({
+    ...DEFAULT_PROFILE,
+    ...profile
+  }));
+
+  // Bereken altijd live de wetenschappelijke waarden op basis van de ingevulde lichaamsgegevens
+  const calculated = useMemo(() => {
+    return calculatePersonalNutrition(form);
+  }, [form.gender, form.age, form.weight, form.height, form.workActivity, form.workoutsPerWeek, form.goalType]);
+
+  // Als 'autoCalculate' aan staat, neem de berekende waarden direct over wanneer bio-inputs veranderen
+  const handleBioChange = (field, value) => {
+    const updated = { ...form, [field]: value };
+    if (updated.autoCalculate) {
+      const recalc = calculatePersonalNutrition(updated);
+      setForm({
+        ...updated,
+        ...recalc
+      });
+    } else {
+      setForm(updated);
+    }
+  };
+
+  const handleToggleAutoCalculate = (enabled) => {
+    if (enabled) {
+      const recalc = calculatePersonalNutrition(form);
+      setForm({
+        ...form,
+        autoCalculate: true,
+        ...recalc
+      });
+    } else {
+      setForm({
+        ...form,
+        autoCalculate: false
+      });
+    }
+  };
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    const finalStats = form.autoCalculate ? calculated : {
+      bmr: calculated.bmr,
+      tdee: calculated.tdee,
+      calorieGoal: Number(form.calorieGoal) || calculated.calorieGoal,
+      proteinGoal: Number(form.proteinGoal) || calculated.proteinGoal,
+      carbsGoal: Number(form.carbsGoal) || calculated.carbsGoal,
+      fatGoal: Number(form.fatGoal) || calculated.fatGoal,
+      waterGoal: Number(form.waterGoal) || calculated.waterGoal
+    };
+
+    const workLabel = WORK_ACTIVITY_LEVELS[form.workActivity]?.label || "Kantoorbaan";
+    const sportSuffix = Number(form.workoutsPerWeek) > 0 ? `${form.workoutsPerWeek}x p/w Sport` : "Geen sport";
+
+    onSaveProfile({
+      ...form,
+      ...finalStats,
+      lifestyleType: `${workLabel.split('/')[0].trim()} + ${sportSuffix}`
+    });
+    onNavigateDashboard();
+  };
+
+  return (
+    <form onSubmit={handleSubmit} className="space-y-6">
+      {/* HEADER KAART */}
+      <div className="bg-gradient-to-br from-emerald-950/90 via-slate-900 to-slate-900 border border-emerald-500/30 rounded-3xl p-5 sm:p-6 shadow-xl">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <div>
+            <span className="text-xs font-bold uppercase tracking-wider text-emerald-400 flex items-center gap-1.5">
+              <Activity className="w-4 h-4" /> Persoonlijke Voeding & Verbranding Calculator
+            </span>
+            <h2 className="text-xl sm:text-2xl font-bold text-white mt-1">
+              Calorieën & Macro's op maat voor jouw lichaam
+            </h2>
+            <p className="text-xs sm:text-sm text-slate-300 mt-1">
+              Berekend met de wetenschappelijke <strong>Mifflin-St Jeor formule</strong> op basis van jouw geslacht, leeftijd, gewicht, lengte, type werk en sport.
+            </p>
+          </div>
+        </div>
+
+        {/* WETENSCHAPPELIJKE VERBRANDING BREAKDOWN (BMR -> TDEE -> DOEL) */}
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mt-5">
+          <div className="bg-slate-950/80 border border-slate-800 rounded-2xl p-4">
+            <div className="text-xs text-slate-400 font-medium">1. Jouw Rustverbranding (BMR)</div>
+            <div className="text-2xl font-extrabold text-white mt-1">
+              {calculated.bmr} <span className="text-xs font-normal text-slate-400">kcal / dag</span>
+            </div>
+            <p className="text-[11px] text-slate-400 mt-1">
+              Wat je lichaam puur in rust verbrandt op basis van {form.weight}kg & {form.height}cm.
+            </p>
+          </div>
+
+          <div className="bg-slate-950/80 border border-slate-800 rounded-2xl p-4">
+            <div className="text-xs text-amber-300 font-medium">2. Verbranding Werk & Sport (TDEE)</div>
+            <div className="text-2xl font-extrabold text-amber-400 mt-1">
+              {calculated.tdee} <span className="text-xs font-normal text-slate-400">kcal / dag</span>
+            </div>
+            <p className="text-[11px] text-slate-400 mt-1">
+              Totale verbranding inclusief jouw dagelijkse werk en {form.workoutsPerWeek}x sporten p/w.
+            </p>
+          </div>
+
+          <div className="bg-emerald-950/60 border border-emerald-500/40 rounded-2xl p-4">
+            <div className="text-xs text-emerald-300 font-bold">3. Jouw Dagelijkse Doel</div>
+            <div className="text-2xl font-black text-emerald-400 mt-1">
+              {form.autoCalculate ? calculated.calorieGoal : form.calorieGoal}{' '}
+              <span className="text-xs font-normal text-emerald-200">kcal / dag</span>
+            </div>
+            <p className="text-[11px] text-emerald-200/80 mt-1">
+              Afgestemd op: {GOAL_TYPES[form.goalType]?.label}
+            </p>
+          </div>
+        </div>
+      </div>
+
+      {/* STAP 1: LICHAAMSGEGEVENS (GESLACHT, LEEFTIJD, GEWICHT, LENGTE) */}
+      <div className="bg-slate-900 border border-slate-800 rounded-3xl p-5 sm:p-6 space-y-5">
+        <h3 className="text-base font-bold text-white flex items-center gap-2">
+          <User className="w-5 h-5 text-emerald-400" />
+          1. Jouw Persoonlijke Gegevens
+        </h3>
+
+        {/* Geslacht keuze */}
+        <div>
+          <label className="block text-xs text-slate-400 mb-2">Geslacht</label>
+          <div className="grid grid-cols-2 gap-3">
+            <button
+              type="button"
+              onClick={() => handleBioChange('gender', 'male')}
+              className={`py-3 px-4 rounded-2xl border font-bold text-sm flex items-center justify-center gap-2 transition ${
+                form.gender === 'male'
+                  ? 'bg-emerald-500/20 border-emerald-500 text-emerald-300 shadow-lg shadow-emerald-500/10'
+                  : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <span>👨</span> Man
+            </button>
+            <button
+              type="button"
+              onClick={() => handleBioChange('gender', 'female')}
+              className={`py-3 px-4 rounded-2xl border font-bold text-sm flex items-center justify-center gap-2 transition ${
+                form.gender === 'female'
+                  ? 'bg-emerald-500/20 border-emerald-500 text-emerald-300 shadow-lg shadow-emerald-500/10'
+                  : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <span>👩</span> Vrouw
+            </button>
+          </div>
+        </div>
+
+        {/* Leeftijd, Gewicht, Lengte */}
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <div className="bg-slate-950 border border-slate-800 rounded-2xl p-3.5">
+            <div className="flex justify-between text-xs mb-1">
+              <span className="text-slate-400">Leeftijd</span>
+              <span className="font-bold text-emerald-400">{form.age} jaar</span>
+            </div>
+            <input
+              type="number"
+              min={14}
+              max={100}
+              value={form.age}
+              onChange={(e) => handleBioChange('age', e.target.value)}
+              className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-white font-bold text-base focus:outline-none focus:border-emerald-500"
+            />
+          </div>
+
+          <div className="bg-slate-950 border border-slate-800 rounded-2xl p-3.5">
+            <div className="flex justify-between text-xs mb-1">
+              <span className="text-slate-400">Huidig Gewicht</span>
+              <span className="font-bold text-emerald-400">{form.weight} kg</span>
+            </div>
+            <input
+              type="number"
+              step="0.5"
+              min={35}
+              max={250}
+              value={form.weight}
+              onChange={(e) => handleBioChange('weight', e.target.value)}
+              className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-white font-bold text-base focus:outline-none focus:border-emerald-500"
+            />
+          </div>
+
+          <div className="bg-slate-950 border border-slate-800 rounded-2xl p-3.5">
+            <div className="flex justify-between text-xs mb-1">
+              <span className="text-slate-400">Lengte</span>
+              <span className="font-bold text-emerald-400">{form.height} cm</span>
+            </div>
+            <input
+              type="number"
+              min={120}
+              max={230}
+              value={form.height}
+              onChange={(e) => handleBioChange('height', e.target.value)}
+              className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-white font-bold text-base focus:outline-none focus:border-emerald-500"
+            />
+          </div>
+        </div>
+      </div>
+
+      {/* STAP 2: WERK, DAGELIJKSE ACTIVITEIT & SPORT */}
+      <div className="bg-slate-900 border border-slate-800 rounded-3xl p-5 sm:p-6 space-y-5">
+        <h3 className="text-base font-bold text-white flex items-center gap-2">
+          <Dumbbell className="w-5 h-5 text-emerald-400" />
+          2. Werk, Beweging & Doelstelling
+        </h3>
+
+        <div>
+          <label className="block text-xs text-slate-400 mb-2">Wat voor werk / dagelijkse beweging heb je?</label>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            {Object.entries(WORK_ACTIVITY_LEVELS).map(([key, item]) => (
+              <button
+                type="button"
+                key={key}
+                onClick={() => handleBioChange('workActivity', key)}
+                className={`p-3.5 rounded-2xl border text-left transition ${
+                  form.workActivity === key
+                    ? 'bg-emerald-500/15 border-emerald-500 text-white'
+                    : 'bg-slate-950 border-slate-800 text-slate-300 hover:border-slate-700'
+                }`}
+              >
+                <div className="font-bold text-xs sm:text-sm flex items-center justify-between">
+                  <span>{item.label}</span>
+                  {form.workActivity === key && <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />}
+                </div>
+                <p className="text-[11px] text-slate-400 mt-1 leading-snug">{item.desc}</p>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Sportfrequentie per week */}
+        <div>
+          <div className="flex items-center justify-between text-xs mb-2">
+            <span className="text-slate-400">Hoe vaak sport of train je gemiddeld per week?</span>
+            <span className="font-bold text-emerald-400">{form.workoutsPerWeek}x per week</span>
+          </div>
+          <div className="grid grid-cols-7 gap-1.5">
+            {[0, 1, 2, 3, 4, 5, 6].map((num) => (
+              <button
+                type="button"
+                key={num}
+                onClick={() => handleBioChange('workoutsPerWeek', num)}
+                className={`py-2.5 rounded-xl font-bold text-xs border transition ${
+                  Number(form.workoutsPerWeek) === num
+                    ? 'bg-emerald-500 text-slate-950 border-emerald-400'
+                    : 'bg-slate-950 text-slate-300 border-slate-800 hover:bg-slate-800'
+                }`}
+              >
+                {num === 6 ? '6+' : `${num}x`}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Doelstelling */}
+        <div>
+          <label className="block text-xs text-slate-400 mb-2">Wat is jouw persoonlijke doel?</label>
+          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2.5">
+            {Object.entries(GOAL_TYPES).map(([key, item]) => (
+              <button
+                type="button"
+                key={key}
+                onClick={() => handleBioChange('goalType', key)}
+                className={`p-3 rounded-2xl border text-left text-xs font-semibold transition flex items-center justify-between ${
+                  form.goalType === key
+                    ? 'bg-emerald-500/20 border-emerald-500 text-emerald-300'
+                    : 'bg-slate-950 border-slate-800 text-slate-300 hover:border-slate-700'
+                }`}
+              >
+                <span>{item.label}</span>
+                {form.goalType === key && <Check className="w-4 h-4 text-emerald-400 shrink-0" />}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* STAP 3: BEREKENDE OF HANDMATIGE MACRO DOELEN */}
+      <div className="bg-slate-900 border border-slate-800 rounded-3xl p-5 sm:p-6 space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-800">
+          <div>
+            <h3 className="text-base font-bold text-white flex items-center gap-2">
+              <Flame className="w-5 h-5 text-emerald-400" />
+              3. Jouw Dagelijkse Voedingsdoelen
+            </h3>
+            <p className="text-xs text-slate-400 mt-0.5">
+              Laat ze automatisch op basis van je profiel berekenen of pas ze handmatig aan.
+            </p>
+          </div>
+
+          <div className="flex bg-slate-950 p-1 rounded-xl border border-slate-800 self-start">
+            <button
+              type="button"
+              onClick={() => handleToggleAutoCalculate(true)}
+              className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition ${
+                form.autoCalculate ? 'bg-emerald-500 text-slate-950' : 'text-slate-400'
+              }`}
+            >
+              Automatisch op maat
+            </button>
+            <button
+              type="button"
+              onClick={() => handleToggleAutoCalculate(false)}
+              className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition ${
+                !form.autoCalculate ? 'bg-emerald-500 text-slate-950' : 'text-slate-400'
+              }`}
+            >
+              Handmatig aanpassen
+            </button>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+          <div className="bg-slate-950 border border-slate-800 rounded-2xl p-3">
+            <label className="block text-xs text-emerald-400 font-semibold mb-1">Calorieën (kcal)</label>
+            <input
+              type="number"
+              disabled={form.autoCalculate}
+              value={form.autoCalculate ? calculated.calorieGoal : form.calorieGoal}
+              onChange={(e) => setForm({ ...form, calorieGoal: e.target.value })}
+              className="w-full bg-slate-900 disabled:bg-slate-950 border border-slate-700 disabled:border-transparent rounded-xl px-2.5 py-1.5 text-base font-extrabold text-white"
+            />
+          </div>
+
+          <div className="bg-slate-950 border border-slate-800 rounded-2xl p-3">
+            <label className="block text-xs text-rose-400 font-semibold mb-1">Eiwitten (g)</label>
+            <input
+              type="number"
+              disabled={form.autoCalculate}
+              value={form.autoCalculate ? calculated.proteinGoal : form.proteinGoal}
+              onChange={(e) => setForm({ ...form, proteinGoal: e.target.value })}
+              className="w-full bg-slate-900 disabled:bg-slate-950 border border-slate-700 disabled:border-transparent rounded-xl px-2.5 py-1.5 text-base font-bold text-white"
+            />
+          </div>
+
+          <div className="bg-slate-950 border border-slate-800 rounded-2xl p-3">
+            <label className="block text-xs text-amber-400 font-semibold mb-1">Koolhydr. (g)</label>
+            <input
+              type="number"
+              disabled={form.autoCalculate}
+              value={form.autoCalculate ? calculated.carbsGoal : form.carbsGoal}
+              onChange={(e) => setForm({ ...form, carbsGoal: e.target.value })}
+              className="w-full bg-slate-900 disabled:bg-slate-950 border border-slate-700 disabled:border-transparent rounded-xl px-2.5 py-1.5 text-base font-bold text-white"
+            />
+          </div>
+
+          <div className="bg-slate-950 border border-slate-800 rounded-2xl p-3">
+            <label className="block text-xs text-violet-400 font-semibold mb-1">Vetten (g)</label>
+            <input
+              type="number"
+              disabled={form.autoCalculate}
+              value={form.autoCalculate ? calculated.fatGoal : form.fatGoal}
+              onChange={(e) => setForm({ ...form, fatGoal: e.target.value })}
+              className="w-full bg-slate-900 disabled:bg-slate-950 border border-slate-700 disabled:border-transparent rounded-xl px-2.5 py-1.5 text-base font-bold text-white"
+            />
+          </div>
+
+          <div className="bg-slate-950 border border-slate-800 rounded-2xl p-3 col-span-2 sm:col-span-1">
+            <label className="block text-xs text-sky-400 font-semibold mb-1">Water (ml)</label>
+            <input
+              type="number"
+              disabled={form.autoCalculate}
+              value={form.autoCalculate ? calculated.waterGoal : form.waterGoal}
+              onChange={(e) => setForm({ ...form, waterGoal: e.target.value })}
+              className="w-full bg-slate-900 disabled:bg-slate-950 border border-slate-700 disabled:border-transparent rounded-xl px-2.5 py-1.5 text-base font-bold text-white"
+            />
+          </div>
+        </div>
+
+        <button
+          type="submit"
+          className="w-full bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-slate-950 font-bold py-3.5 px-6 rounded-2xl flex items-center justify-center gap-2 shadow-lg shadow-emerald-500/20 transition"
+        >
+          <CheckCircle2 className="w-5 h-5" /> Sla Mijn Persoonlijke Doelen Op
+        </button>
+
+        <button
+          type="button"
+          onClick={onOpenDownloadModal}
+          className="w-full bg-slate-950 hover:bg-slate-800 border border-slate-800 text-slate-300 font-semibold py-3 px-4 rounded-2xl flex items-center justify-center gap-2 text-xs transition"
+        >
+          <Download className="w-4 h-4 text-emerald-400" /> App Installeren of Dagboek Downloaden (.CSV / Back-up)
+        </button>
+      </div>
+    </form>
+  );
+}
+
+// ==========================================
+// TAB 4: RECEPTEN ZOEKER & AI GENERATOR
+// ==========================================
+function RecipesView({
+  profile,
+  todayStats,
+  savedRecipes,
+  onLogRecipe,
+  onSaveFavorite,
+  onDeleteFavorite,
+  showToast
+}) {
+  const [searchQuery, setSearchQuery] = useState("");
+  const [activeFilter, setActiveFilter] = useState("Passend bij mijn dag");
+  const [recipes, setRecipes] = useState(STARTER_RECIPES);
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [selectedRecipe, setSelectedRecipe] = useState(null);
+  const [viewTab, setViewTab] = useState('discover'); // 'discover' | 'favorites'
+
+  const remainingMacros = {
+    calories: Math.max(300, (profile.calorieGoal || 2200) - todayStats.calories),
+    protein: Math.max(20, (profile.proteinGoal || 140) - todayStats.protein)
+  };
+
+  const filterChips = [
+    "Passend bij mijn dag",
+    "Snel & Eiwitrijk (< 15 min)",
+    "Onder 500 kcal",
+    "Gezonde Lunch",
+    "Vegetarisch Krachtvoer",
+    "Gezonde Avondsnack"
+  ];
+
+  const handleSearchRecipes = async (customFilter = activeFilter) => {
+    setIsGenerating(true);
+    try {
+      const generated = await generateRecipesWithGemini(searchQuery, remainingMacros, customFilter);
+      if (Array.isArray(generated) && generated.length > 0) {
+        setRecipes(generated.map((r, i) => ({ ...r, id: `ai-rec-${Date.now()}-${i}` })));
+        showToast("Nieuwe recepten op maat gegenereerd! 👨‍🍳");
+      }
+    } catch (err) {
+      console.error(err);
+      showToast("Kon even geen nieuwe recepten ophalen.", "error");
+    } finally {
+      setIsGenerating(false);
+    }
+  };
+
+  const displayedRecipes = viewTab === 'favorites' ? savedRecipes : recipes;
+
+  return (
+    <div className="space-y-6">
+      {/* HEADER & ZOEKBALK */}
+      <div className="bg-slate-900 border border-slate-800 rounded-3xl p-5 sm:p-6 space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div>
+            <h2 className="text-xl font-bold text-white flex items-center gap-2">
+              <ChefHat className="w-6 h-6 text-emerald-400" /> Slimme Recepten Keuken
+            </h2>
+            <p className="text-xs sm:text-sm text-slate-400 mt-0.5">
+              Zoek elk gerecht of laat recepten bedenken voor jouw resterende{' '}
+              <span className="text-emerald-400 font-semibold">{remainingMacros.calories} kcal</span> &{' '}
+              <span className="text-rose-400 font-semibold">{remainingMacros.protein}g eiwit</span>.
+            </p>
+          </div>
+
+          <div className="flex bg-slate-950 p-1 rounded-xl border border-slate-800 self-start">
+            <button
+              onClick={() => setViewTab('discover')}
+              className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition ${
+                viewTab === 'discover' ? 'bg-emerald-500 text-slate-950' : 'text-slate-400'
+              }`}
+            >
+              Ontdekken ({recipes.length})
+            </button>
+            <button
+              onClick={() => setViewTab('favorites')}
+              className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition ${
+                viewTab === 'favorites' ? 'bg-emerald-500 text-slate-950' : 'text-slate-400'
+              }`}
+            >
+              Mijn Favorieten ({savedRecipes.length})
+            </button>
+          </div>
+        </div>
+
+        {viewTab === 'discover' && (
+          <>
+            <div className="flex flex-col sm:flex-row gap-2">
+              <div className="relative flex-1">
+                <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
+                <input
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && handleSearchRecipes()}
+                  placeholder="Waar heb je trek in? (bijv. 'kip pesto', 'wraps', 'pannenkoeken')..."
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl pl-10 pr-4 py-3 text-sm text-white focus:outline-none focus:border-emerald-500"
+                />
+              </div>
+              <button
+                onClick={() => handleSearchRecipes()}
+                disabled={isGenerating}
+                className="bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-bold px-5 py-3 rounded-xl text-sm flex items-center justify-center gap-2 shrink-0 shadow-lg shadow-emerald-500/20 transition"
+              >
+                {isGenerating ? (
+                  <>
+                    <RefreshCw className="w-4 h-4 animate-spin" /> Bedenken...
+                  </>
+                ) : (
+                  <>
+                    <Sparkles className="w-4 h-4" /> Zoek / Genereer
+                  </>
+                )}
+              </button>
+            </div>
+
+            {/* SNELLE FILTER CHIPS */}
+            <div className="flex items-center gap-2 overflow-x-auto pb-1 no-scrollbar">
+              {filterChips.map((chip) => (
+                <button
+                  key={chip}
+                  onClick={() => {
+                    setActiveFilter(chip);
+                    handleSearchRecipes(chip);
+                  }}
+                  className={`text-xs px-3 py-1.5 rounded-xl whitespace-nowrap font-medium border transition ${
+                    activeFilter === chip
+                      ? 'bg-emerald-500/20 border-emerald-500 text-emerald-300'
+                      : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  {chip}
+                </button>
+              ))}
+            </div>
+          </>
+        )}
+      </div>
+
+      {/* RECEPTEN LIJST */}
+      {displayedRecipes.length === 0 ? (
+        <div className="bg-slate-900 border border-slate-800 rounded-3xl p-10 text-center space-y-2">
+          <Bookmark className="w-8 h-8 text-slate-500 mx-auto" />
+          <h3 className="font-bold text-white">Nog geen opgeslagen recepten</h3>
+          <p className="text-xs text-slate-400">Bewaar je favoriete recepten zodat je ze altijd snel kunt klaarmaken.</p>
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          {displayedRecipes.map((rec) => (
+            <div
+              key={rec.id || rec.title}
+              className="bg-slate-900 border border-slate-800 hover:border-emerald-500/40 rounded-3xl p-5 flex flex-col justify-between transition group"
+            >
+              <div>
+                <div className="flex items-center justify-between gap-2 mb-2">
+                  <span className="text-[11px] font-bold uppercase tracking-wider px-2.5 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400">
+                    {rec.mealType}
+                  </span>
+                  <span className="text-xs text-slate-400 flex items-center gap-1">
+                    <Clock className="w-3.5 h-3.5" /> {rec.prepTimeMinutes} min
+                  </span>
+                </div>
+
+                <h3 className="font-bold text-white text-base group-hover:text-emerald-300 transition">
+                  {rec.title}
+                </h3>
+                <p className="text-xs text-slate-400 mt-1.5 line-clamp-2 leading-relaxed">
+                  {rec.shortDescription}
+                </p>
+
+                {/* MACRO BADGES */}
+                <div className="grid grid-cols-4 gap-1.5 my-4 bg-slate-950 p-2.5 rounded-2xl border border-slate-800/80 text-center">
+                  <div>
+                    <div className="text-xs font-extrabold text-emerald-400">{rec.calories}</div>
+                    <div className="text-[10px] text-slate-500">kcal</div>
+                  </div>
+                  <div>
+                    <div className="text-xs font-bold text-rose-400">{rec.protein}g</div>
+                    <div className="text-[10px] text-slate-500">eiwit</div>
+                  </div>
+                  <div>
+                    <div className="text-xs font-bold text-amber-400">{rec.carbs}g</div>
+                    <div className="text-[10px] text-slate-500">koolh</div>
+                  </div>
+                  <div>
+                    <div className="text-xs font-bold text-violet-400">{rec.fat}g</div>
+                    <div className="text-[10px] text-slate-500">vet</div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="space-y-2 pt-2">
+                <button
+                  onClick={() => setSelectedRecipe(rec)}
+                  className="w-full bg-slate-800 hover:bg-slate-700 text-white font-semibold text-xs py-2.5 px-4 rounded-xl transition"
+                >
+                  Bekijk Ingrediënten & Bereiding
+                </button>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => onLogRecipe(rec)}
+                    className="flex-1 bg-emerald-500/20 hover:bg-emerald-500 text-emerald-300 hover:text-slate-950 font-semibold text-xs py-2 px-3 rounded-xl transition flex items-center justify-center gap-1"
+                  >
+                    <Plus className="w-3.5 h-3.5" /> Log in Dagboek
+                  </button>
+                  {viewTab === 'favorites' ? (
+                    <button
+                      onClick={() => onDeleteFavorite(rec.id)}
+                      className="p-2 bg-rose-500/15 hover:bg-rose-500/30 text-rose-400 rounded-xl transition"
+                      title="Verwijder uit favorieten"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  ) : (
+                    <button
+                      onClick={() => onSaveFavorite(rec)}
+                      className="p-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl transition"
+                      title="Bewaar in favorieten"
+                    >
+                      <Bookmark className="w-4 h-4" />
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* DETAIL MODAL VOOR RECEPT BEREIDING */}
+      {selectedRecipe && (
+        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-700 rounded-3xl max-w-xl w-full max-h-[88vh] overflow-y-auto p-6 space-y-5 shadow-2xl">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <span className="text-xs font-bold uppercase text-emerald-400">
+                  {selectedRecipe.mealType} • {selectedRecipe.prepTimeMinutes} minuten
+                </span>
+                <h3 className="text-xl font-bold text-white mt-0.5">{selectedRecipe.title}</h3>
+              </div>
+              <button
+                onClick={() => setSelectedRecipe(null)}
+                className="p-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <p className="text-xs sm:text-sm text-slate-300 leading-relaxed">{selectedRecipe.shortDescription}</p>
+
+            {/* Macro Samenvatting */}
+            <div className="grid grid-cols-4 gap-2 bg-slate-950 p-3.5 rounded-2xl border border-slate-800 text-center">
+              <div>
+                <div className="text-base font-extrabold text-emerald-400">{selectedRecipe.calories}</div>
+                <div className="text-xs text-slate-400">Calorieën</div>
+              </div>
+              <div>
+                <div className="text-base font-bold text-rose-400">{selectedRecipe.protein}g</div>
+                <div className="text-xs text-slate-400">Eiwitten</div>
+              </div>
+              <div>
+                <div className="text-base font-bold text-amber-400">{selectedRecipe.carbs}g</div>
+                <div className="text-xs text-slate-400">Koolhydr.</div>
+              </div>
+              <div>
+                <div className="text-base font-bold text-violet-400">{selectedRecipe.fat}g</div>
+                <div className="text-xs text-slate-400">Vetten</div>
+              </div>
+            </div>
+
+            {/* Ingrediënten */}
+            <div>
+              <h4 className="font-bold text-white text-sm mb-2.5">Ingrediënten (1 persoon)</h4>
+              <ul className="space-y-1.5 bg-slate-950/60 p-4 rounded-2xl border border-slate-800">
+                {selectedRecipe.ingredients?.map((ing, i) => (
+                  <li key={i} className="text-xs sm:text-sm text-slate-200 flex items-center gap-2">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+                    {ing}
+                  </li>
+                ))}
+              </ul>
+            </div>
+
+            {/* Bereidingsstappen */}
+            <div>
+              <h4 className="font-bold text-white text-sm mb-2.5">Bereidingswijze</h4>
+              <ol className="space-y-3">
+                {selectedRecipe.instructions?.map((step, i) => (
+                  <li key={i} className="flex gap-3 text-xs sm:text-sm text-slate-300 leading-relaxed">
+                    <span className="w-6 h-6 rounded-lg bg-emerald-500/20 text-emerald-400 font-bold flex items-center justify-center shrink-0 text-xs">
+                      {i + 1}
+                    </span>
+                    <span>{step}</span>
+                  </li>
+                ))}
+              </ol>
+            </div>
+
+            <div className="flex gap-3 pt-2">
+              <button
+                onClick={() => {
+                  onLogRecipe(selectedRecipe);
+                  setSelectedRecipe(null);
+                }}
+                className="flex-1 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold py-3 px-4 rounded-2xl text-sm flex items-center justify-center gap-2 transition"
+              >
+                <CheckCircle2 className="w-4 h-4" /> Klaargemaakt? Voeg toe aan dagboek
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
