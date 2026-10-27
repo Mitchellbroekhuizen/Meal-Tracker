@@ -128,7 +128,87 @@ try {
 // ==========================================
 // GEMINI API HELPERS MET EXPONENTIAL BACKOFF
 // ==========================================
-const apiKey = ""; // Wordt automatisch ingevuld door de omgeving
+// Gemini API-sleutel: wordt alleen lokaal op dit apparaat bewaard (niet in de repo)
+const API_KEY_STORAGE = 'nutripulse_gemini_key';
+const GEMINI_MODEL = 'gemini-flash-latest';
+function getApiKey() {
+  try { return localStorage.getItem(API_KEY_STORAGE) || ''; } catch (e) { return ''; }
+}
+function setApiKey(key) {
+  try {
+    if (key) localStorage.setItem(API_KEY_STORAGE, key.trim());
+    else localStorage.removeItem(API_KEY_STORAGE);
+  } catch (e) {}
+  window.dispatchEvent(new Event('apikey-changed'));
+}
+function geminiUrl() {
+  const key = getApiKey();
+  if (!key) throw new Error('GEEN_API_SLEUTEL');
+  return `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(key)}`;
+}
+function aiErrorMessage(err, fallback) {
+  const msg = String(err && err.message || '');
+  if (msg === 'GEEN_API_SLEUTEL') return 'Vul eerst je Gemini API-sleutel in (bovenaan dit scherm).';
+  if (/API Fout \((400|401|403)\)/.test(msg) && /key|API_KEY/i.test(msg)) return 'Je Gemini API-sleutel klopt niet. Controleer of je hem goed hebt geplakt.';
+  if (/API Fout \(429\)/.test(msg)) return 'Te veel aanvragen bij Gemini. Wacht even en probeer het opnieuw.';
+  return fallback;
+}
+
+// Invoerveld voor de API-sleutel
+function ApiKeyBox() {
+  const [key, setKey] = useState(getApiKey());
+  const [draft, setDraft] = useState('');
+  const [editing, setEditing] = useState(!getApiKey());
+  useEffect(() => {
+    const onChange = () => setKey(getApiKey());
+    window.addEventListener('apikey-changed', onChange);
+    return () => window.removeEventListener('apikey-changed', onChange);
+  }, []);
+
+  if (key && !editing) {
+    return (
+      <div className="flex items-center justify-between gap-3 text-xs text-slate-400 bg-slate-950 border border-slate-800 rounded-2xl px-4 py-2.5">
+        <span className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-400" /> AI-sleutel ingesteld (…{key.slice(-4)})</span>
+        <button onClick={() => { setDraft(''); setEditing(true); }} className="text-emerald-400 hover:text-emerald-300 font-semibold">Wijzigen</button>
+      </div>
+    );
+  }
+  return (
+    <div className="bg-amber-500/10 border border-amber-500/30 rounded-2xl p-4 space-y-3">
+      <div className="flex items-start gap-2 text-xs text-amber-200 leading-relaxed">
+        <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+        <span>
+          Voor de AI-functies heb je een gratis Gemini API-sleutel nodig. Maak er een aan op{' '}
+          <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener" className="underline font-semibold">aistudio.google.com/apikey</a>{' '}
+          en plak hem hieronder. Hij wordt alleen op dit apparaat bewaard.
+        </span>
+      </div>
+      <div className="flex gap-2">
+        <input
+          type="password"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          placeholder="Plak je API-sleutel (begint met AIza…)"
+          autoComplete="off"
+          className="flex-1 min-w-0 bg-slate-950 border border-slate-700 rounded-xl px-3 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500"
+        />
+        <button
+          onClick={() => { if (draft.trim()) { setApiKey(draft); setEditing(false); } }}
+          disabled={!draft.trim()}
+          className="bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 text-slate-950 font-bold px-4 rounded-xl text-sm"
+        >
+          Opslaan
+        </button>
+      </div>
+      {key && (
+        <div className="flex gap-4 text-xs">
+          <button onClick={() => setEditing(false)} className="text-slate-400 hover:text-slate-200">Annuleren</button>
+          <button onClick={() => { setApiKey(''); }} className="text-red-400 hover:text-red-300">Sleutel verwijderen</button>
+        </div>
+      )}
+    </div>
+  );
+}
 
 async function fetchWithRetry(url, options, maxRetries = 4) {
   let delay = 1000;
@@ -140,10 +220,12 @@ async function fetchWithRetry(url, options, maxRetries = 4) {
       }
       if (response.status !== 429 && response.status < 500) {
         const errText = await response.text();
-        throw new Error(`API Fout (${response.status}): ${errText}`);
+        const fatal = new Error(`API Fout (${response.status}): ${errText}`);
+        fatal.noRetry = true;
+        throw fatal;
       }
     } catch (err) {
-      if (i === maxRetries - 1) throw err;
+      if (err.noRetry || i === maxRetries - 1) throw err;
     }
     await new Promise(resolve => setTimeout(resolve, delay));
     delay *= 2;
@@ -152,7 +234,7 @@ async function fetchWithRetry(url, options, maxRetries = 4) {
 
 // 1. Analyseer Foto van Maaltijd
 async function analyzeMealImageWithGemini(base64Data, mimeType = "image/jpeg", extraNote = "") {
-  const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`;
+  const apiUrl = geminiUrl();
   
   const prompt = `Je bent een deskundige Nederlandse diëtist en voedingswetenschapper. Analyseer deze foto van een maaltijd of snack. 
   ${extraNote ? `Extra context van de gebruiker: "${extraNote}".` : ''}
@@ -207,7 +289,7 @@ async function analyzeMealImageWithGemini(base64Data, mimeType = "image/jpeg", e
 
 // 2. Analyseer Tekstuele Omschrijving van Maaltijd
 async function analyzeMealTextWithGemini(description) {
-  const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`;
+  const apiUrl = geminiUrl();
   
   const prompt = `Je bent een Nederlandse voedingsdeskundige. Bereken de voedingswaarden voor de volgende gegeten of gedronken items: "${description}".
   Schat standaard Nederlandse portiegroottes in als die niet expliciet vermeld zijn.`;
@@ -247,7 +329,7 @@ async function analyzeMealTextWithGemini(description) {
 
 // 3. Persoonlijk Leefstijl & Maaltijdadvies op het huidige moment
 async function getLiveCoachAdvice(profile, todayStats, loggedMeals, currentTimeStr) {
-  const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`;
+  const apiUrl = geminiUrl();
 
   const mealSummary = loggedMeals.length > 0 
     ? loggedMeals.map(m => `${m.time} (${m.mealType}): ${m.mealName} (${m.calories} kcal, ${m.protein}g E)`).join('; ')
@@ -313,7 +395,7 @@ async function getLiveCoachAdvice(profile, todayStats, loggedMeals, currentTimeS
 
 // 4. Recepten Zoeker & Generator
 async function generateRecipesWithGemini(query, remainingMacros, filterTag) {
-  const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`;
+  const apiUrl = geminiUrl();
 
   const prompt = `Genereer 3 heerlijke, gezonde en praktisch te bereiden Nederlandse recepten.
   Zoekopdracht van gebruiker: "${query || 'Verras me met gezonde maaltijden'}"
@@ -1944,7 +2026,7 @@ function LogMealView({ selectedDate, onSaveMeal, showToast }) {
       showToast("Foto succesvol geanalyseerd door AI! ✨");
     } catch (err) {
       console.error(err);
-      showToast("Kon de foto niet analyseren. Probeer het opnieuw of vul handmatig in.", "error");
+      showToast(aiErrorMessage(err, "Kon de foto niet analyseren. Probeer het opnieuw of vul handmatig in."), "error");
     } finally {
       setIsAnalyzing(false);
     }
@@ -1971,7 +2053,7 @@ function LogMealView({ selectedDate, onSaveMeal, showToast }) {
       showToast("Voedingswaarde berekend!");
     } catch (err) {
       console.error(err);
-      showToast("Kon tekst niet berekenen. Probeer het nog eens.", "error");
+      showToast(aiErrorMessage(err, "Kon tekst niet berekenen. Probeer het nog eens."), "error");
     } finally {
       setIsAnalyzing(false);
     }
@@ -2021,6 +2103,8 @@ function LogMealView({ selectedDate, onSaveMeal, showToast }) {
           <Edit3 className="w-4 h-4" /> Handmatig
         </button>
       </div>
+
+      {(mode === 'photo' || mode === 'ai-text') && <ApiKeyBox />}
 
       {/* MODUS 1: AI FOTO SCANNER */}
       {mode === 'photo' && (
@@ -2328,7 +2412,7 @@ function LifestyleCoachView({
       setAiAdvice(result);
     } catch (err) {
       console.error(err);
-      showToast("Kon AI Coach advies even niet ophalen.", "error");
+      showToast(aiErrorMessage(err, "Kon AI Coach advies even niet ophalen.").replace(" (bovenaan dit scherm)", " (via Maaltijd toevoegen → Typ & Bereken)"), "error");
     } finally {
       setLoadingAdvice(false);
     }
@@ -3023,7 +3107,7 @@ function RecipesView({
       }
     } catch (err) {
       console.error(err);
-      showToast("Kon even geen nieuwe recepten ophalen.", "error");
+      showToast(aiErrorMessage(err, "Kon even geen nieuwe recepten ophalen.").replace(" (bovenaan dit scherm)", " (via Maaltijd toevoegen → Typ & Bereken)"), "error");
     } finally {
       setIsGenerating(false);
     }
