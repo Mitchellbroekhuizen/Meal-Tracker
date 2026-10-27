@@ -131,7 +131,7 @@ try {
 // Gemini API-sleutel: wordt alleen lokaal op dit apparaat bewaard (niet in de repo)
 const API_KEY_STORAGE = 'nutripulse_gemini_key';
 const GEMINI_MODEL = 'gemini-3.5-flash';
-const APP_VERSION = '9';
+const APP_VERSION = '10';
 function getApiKey() {
   try { return localStorage.getItem(API_KEY_STORAGE) || ''; } catch (e) { return ''; }
 }
@@ -359,13 +359,13 @@ let AI_CTX = { profile: null, todayStats: null, todayMeals: [] };
 function setAiContext(ctx) { AI_CTX = ctx; }
 
 const GOAL_GUIDANCE = {
-  cut_fast: `DOEL = AFVALLEN (ca. 500 kcal tekort per dag, ±0,5 kg per week).
+  cut_fast: `DOEL = AFVALLEN (zie het tempo hierboven).
   - Blijf binnen het resterende caloriebudget van vandaag; reken altijd kcal en eiwit door.
   - Kies eiwitrijk (verzadiging en spierbehoud), veel groente, vezels en volume met een lage energiedichtheid.
   - Beperk suiker, frituur, romige sauzen, grote hoeveelheden kaas/olie, alcohol en calorierijke dranken.
   - Noem waar zinvol een concrete lichtere ruil of kleinere portie (bijv. magere kwark i.p.v. volle yoghurt).
   - Wees eerlijk als iets slecht in het budget past, maar nooit streng of schuldig makend. Adviseer nooit maaltijden over te slaan of onder het veilige minimum te eten.`,
-  cut_mild: `DOEL = RUSTIG AFVALLEN (ca. 250 kcal tekort per dag, ±0,25 kg per week).
+  cut_mild: `DOEL = RUSTIG AFVALLEN (zie het tempo hierboven).
   - Blijf ongeveer binnen het resterende caloriebudget; eiwitrijk, veel groente en vezels.
   - Wees flexibel: kleine ruilen en porties bijstellen in plaats van dingen verbieden.
   - Adviseer nooit maaltijden over te slaan.`,
@@ -379,13 +379,10 @@ const GOAL_GUIDANCE = {
   - Ruim eiwit verdeeld over de dag. Geef aan als er nog veel calorieën open staan.`
 };
 
-// Hoeveel weken tot streefgewicht (7700 kcal ≈ 1 kg)
+// Hoeveel weken tot streefgewicht (7700 kcal ≈ 1 kg), op basis van het werkelijke dagtekort/-overschot
 function weeksToTarget(profile) {
-  const w = Number(profile?.weight), t = Number(profile?.targetWeight);
-  const delta = GOAL_TYPES[profile?.goalType]?.kcalDelta || 0;
-  if (!w || !t || !delta || Math.abs(w - t) < 0.5) return null;
-  if ((delta < 0 && t >= w) || (delta > 0 && t <= w)) return null; // doel en richting passen niet bij elkaar
-  return Math.ceil((Math.abs(w - t) * 7700) / (Math.abs(delta) * 7));
+  if (!profile) return null;
+  return calculatePersonalNutrition(profile).realisticWeeks;
 }
 
 function buildAiContext() {
@@ -393,7 +390,13 @@ function buildAiContext() {
   if (!p) return '';
   const s = AI_CTX.todayStats || { calories: 0, protein: 0, carbs: 0, fat: 0, water: 0 };
   const meals = AI_CTX.todayMeals || [];
-  const goalKey = GOAL_TYPES[p.goalType] ? p.goalType : 'maintain';
+  const calc = calculatePersonalNutrition(p);
+  const d = calc.effectiveDelta;
+  const goalKey = d <= -400 ? 'cut_fast' : d < 0 ? 'cut_mild' : d === 0 ? 'maintain' : d <= 300 ? 'lean_bulk' : 'bulk';
+  const paceLine = `- Tempo: ${d < 0 ? `${-d} kcal per dag tekort (≈ ${(-d * 7 / 7700).toFixed(2)} kg per week eraf)` : d > 0 ? `${d} kcal per dag overschot (≈ ${(d * 7 / 7700).toFixed(2)} kg per week erbij)` : 'onderhoud'}${p.targetWeeks ? ` — zelf gekozen: streefgewicht in ${p.targetWeeks} weken${calc.paceLimited ? ' (begrensd tot een veilig tempo)' : ''}` : ''}`;
+  const strictLine = d < -600
+    ? `\nDit is een STEVIG tekort: geef extra nadruk op eiwit (spierbehoud), veel groente/volume voor verzadiging, voldoende vezels en micronutriënten, en reken porties nauwkeurig door. Moedig voldoende slaap en water aan.`
+    : '';
   const left = {
     kcal: Math.round((p.calorieGoal || 0) - s.calories),
     protein: Math.round((p.proteinGoal || 0) - s.protein),
@@ -406,7 +409,8 @@ function buildAiContext() {
   return `
 === GEBRUIKERSPROFIEL (houd hier altijd rekening mee) ===
 - ${p.gender === 'female' ? 'Vrouw' : 'Man'}, ${p.age} jaar, ${p.weight} kg, ${p.height} cm${p.targetWeight ? `, streefgewicht ${p.targetWeight} kg` : ''}${weeks ? ` (nog ca. ${weeks} weken bij dit tempo)` : ''}
-- Doel: ${GOAL_TYPES[goalKey].label}
+- Doel: ${calc.goalLabel}
+${paceLine}
 - Werk: ${WORK_ACTIVITY_LEVELS[p.workActivity]?.label || p.lifestyleType}; sport ${p.workoutsPerWeek}x per week${p.workoutTime ? `, vandaag om ${p.workoutTime}` : ''}
 - Dagritme: op om ${p.wakeTime}, slapen om ${p.sleepTime}. Het is nu ${time}.
 - Voedingsvoorkeuren/allergieën: ${p.foodPreferences?.trim() || 'geen opgegeven'}
@@ -415,7 +419,7 @@ function buildAiContext() {
 - Maaltijden vandaag: ${meals.length ? meals.map(m => `${m.time || ''} ${m.mealType}: ${m.mealName} (${m.calories} kcal)`).join('; ') : 'nog niets'}
 - NOG OVER VANDAAG: ${left.kcal} kcal, ${left.protein} g eiwit, ${left.carbs} g kh, ${left.fat} g vet
 
-${GOAL_GUIDANCE[goalKey]}
+${GOAL_GUIDANCE[goalKey]}${strictLine}
 Respecteer de voedingsvoorkeuren/allergieën altijd. Antwoord in het Nederlands.
 === EINDE PROFIEL ===
 `;
@@ -770,14 +774,44 @@ function calculatePersonalNutrition(profileData) {
   const totalMultiplier = workFactor + workoutBonusMultiplier;
   const tdee = Math.round(bmr * totalMultiplier);
 
-  // 3. Dagelijks Caloriedoel op basis van gekozen doel
-  const goalObj = GOAL_TYPES[goalKey];
+  // 3. Dagelijks Caloriedoel: gekozen doel, of eigen tempo (streefgewicht in X weken)
   const minSafeCalories = gender === 'female' ? 1250 : 1500;
+  let goalObj = GOAL_TYPES[goalKey];
+  let goalLabel = goalObj.label;
+  let requestedDelta = null;
+  let paceLimited = false;
+  const targetWeight = Number(profileData.targetWeight);
+  const targetWeeks = Number(profileData.targetWeeks);
+  if (targetWeight && targetWeeks > 0 && Math.abs(weight - targetWeight) >= 0.5) {
+    const losing = targetWeight < weight;
+    requestedDelta = Math.round((losing ? -1 : 1) * (Math.abs(weight - targetWeight) * 7700) / (targetWeeks * 7));
+    // Veilige grenzen: max ~1% lichaamsgewicht per week, max 30% onder je verbranding, nooit meer dan 1000 kcal tekort / 750 overschot
+    const maxDeficit = Math.min(1000, Math.round(tdee * 0.3), Math.round(weight * 11));
+    const maxSurplus = 750;
+    const delta = losing ? Math.max(requestedDelta, -maxDeficit) : Math.min(requestedDelta, maxSurplus);
+    paceLimited = delta !== requestedDelta;
+    const base = losing ? GOAL_TYPES.cut_fast : (delta <= 300 ? GOAL_TYPES.lean_bulk : GOAL_TYPES.bulk);
+    goalObj = {
+      ...base,
+      kcalDelta: delta,
+      // Bij een groot tekort extra eiwit voor spierbehoud
+      proteinPerKg: losing && delta < -600 ? 2.3 : base.proteinPerKg
+    };
+    goalLabel = `${losing ? 'Afvallen' : 'Aankomen'} naar ${targetWeight} kg in ${targetWeeks} weken`;
+  }
   const calorieGoal = Math.max(minSafeCalories, Math.round(tdee + goalObj.kcalDelta));
+  const effectiveDelta = calorieGoal - tdee;
+  if (requestedDelta !== null && effectiveDelta !== requestedDelta) paceLimited = true;
+  const realisticWeeks = (targetWeight && Math.abs(weight - targetWeight) >= 0.5 && effectiveDelta !== 0 &&
+    ((effectiveDelta < 0) === (targetWeight < weight)))
+    ? Math.ceil((Math.abs(weight - targetWeight) * 7700) / (Math.abs(effectiveDelta) * 7))
+    : null;
 
   // 4. Macro's berekenen op basis van lichaamsgewicht
-  const proteinGoal = Math.round(weight * goalObj.proteinPerKg);
-  const fatGoal = Math.max(40, Math.round(weight * goalObj.fatPerKg));
+  // Bij een hoog gewicht (BMI > 27) rekenen we met een referentiegewicht, anders worden eiwit en vet onrealistisch hoog
+  const refWeight = Math.min(weight, Math.round(27 * Math.pow(height / 100, 2)));
+  const proteinGoal = Math.round(refWeight * goalObj.proteinPerKg);
+  const fatGoal = Math.max(40, Math.round(refWeight * goalObj.fatPerKg));
   const usedCalories = (proteinGoal * 4) + (fatGoal * 9);
   const remainingForCarbs = Math.max(200, calorieGoal - usedCalories);
   const carbsGoal = Math.round(remainingForCarbs / 4);
@@ -795,7 +829,12 @@ function calculatePersonalNutrition(profileData) {
     proteinGoal,
     carbsGoal,
     fatGoal,
-    waterGoal
+    waterGoal,
+    effectiveDelta,
+    requestedDelta,
+    paceLimited,
+    realisticWeeks,
+    goalLabel
   };
 }
 
@@ -950,7 +989,7 @@ function generateSmartSchedule(profile, todayStats, loggedMeals) {
   const hasLunch = loggedMeals.some(m => m.mealType === "Lunch");
   const hasDinner = loggedMeals.some(m => m.mealType === "Avondeten");
   const hasSnack = loggedMeals.some(m => m.mealType === "Tussendoortje");
-  const goalDelta = GOAL_TYPES[profile.goalType]?.kcalDelta || 0;
+  const goalDelta = calculatePersonalNutrition(profile).effectiveDelta || 0;
   const goalHint = goalDelta < 0
     ? ' Afvallen: vul je bord voor de helft met groente en houd sauzen en olie beperkt.'
     : goalDelta > 0
@@ -1895,11 +1934,11 @@ function DashboardView({ selectedDate, setSelectedDate, stats, profile, meals, o
                 {profile.gender === 'female' ? 'Vrouw' : 'Man'} • {profile.age}j • {profile.weight}kg • {profile.height}cm
               </span>
               <span className="text-[11px] bg-emerald-500/10 text-emerald-300 px-2.5 py-0.5 rounded-full border border-emerald-500/20">
-                {GOAL_TYPES[profile.goalType]?.label || 'Persoonlijk Doel'}
+                {calculatePersonalNutrition(profile).goalLabel || 'Persoonlijk Doel'}
               </span>
               {profile.targetWeight && weeksToTarget(profile) && (
                 <span className="text-[11px] bg-amber-500/10 text-amber-300 px-2.5 py-0.5 rounded-full border border-amber-500/20">
-                  🎯 {profile.targetWeight} kg over ~{weeksToTarget(profile)} wk
+                  🎯 {profile.targetWeight} kg over ~{weeksToTarget(profile)} wk{profile.targetWeeks ? ' (eigen tempo)' : ''}
                 </span>
               )}
               <button
@@ -2722,7 +2761,7 @@ function LifestyleCoachView({
               Wat en wanneer kan ik nu het beste eten?
             </h2>
             <p className="text-xs sm:text-sm text-slate-300">
-              Afgestemd op jouw doel ({GOAL_TYPES[profile.goalType]?.label || 'persoonlijk doel'}), profiel ({profile.gender === 'female' ? 'Vrouw' : 'Man'}, {profile.age}j, {profile.weight}kg), jouw werk ({WORK_ACTIVITY_LEVELS[profile.workActivity]?.label || profile.lifestyleType}) en je resterende macro's.
+              Afgestemd op jouw doel ({calculatePersonalNutrition(profile).goalLabel || 'persoonlijk doel'}), profiel ({profile.gender === 'female' ? 'Vrouw' : 'Man'}, {profile.age}j, {profile.weight}kg), jouw werk ({WORK_ACTIVITY_LEVELS[profile.workActivity]?.label || profile.lifestyleType}) en je resterende macro's.
             </p>
           </div>
 
@@ -2808,7 +2847,7 @@ function LifestyleCoachView({
           </span>
           <h2 className="text-lg sm:text-xl font-bold text-white mt-1">Wat eet ik de rest van vandaag?</h2>
           <p className="text-xs text-slate-400 mt-1">
-            Een compleet menu dat past bij je doel ({GOAL_TYPES[profile.goalType]?.label || 'persoonlijk doel'}) en de{' '}
+            Een compleet menu dat past bij je doel ({calculatePersonalNutrition(profile).goalLabel || 'persoonlijk doel'}) en de{' '}
             <span className="text-emerald-400 font-semibold">{Math.max(0, Math.round((profile.calorieGoal || 0) - todayStats.calories))} kcal</span> die je nog over hebt.
           </p>
         </div>
@@ -3039,7 +3078,7 @@ function PersonalProfileCalculatorView({ profile, onSaveProfile, onNavigateDashb
   // Bereken altijd live de wetenschappelijke waarden op basis van de ingevulde lichaamsgegevens
   const calculated = useMemo(() => {
     return calculatePersonalNutrition(form);
-  }, [form.gender, form.age, form.weight, form.height, form.workActivity, form.workoutsPerWeek, form.goalType]);
+  }, [form.gender, form.age, form.weight, form.height, form.workActivity, form.workoutsPerWeek, form.goalType, form.targetWeight, form.targetWeeks]);
 
   // Als 'autoCalculate' aan staat, neem de berekende waarden direct over wanneer bio-inputs veranderen
   const handleBioChange = (field, value) => {
@@ -3141,7 +3180,10 @@ function PersonalProfileCalculatorView({ profile, onSaveProfile, onNavigateDashb
               <span className="text-xs font-normal text-emerald-200">kcal / dag</span>
             </div>
             <p className="text-[11px] text-emerald-200/80 mt-1">
-              Afgestemd op: {GOAL_TYPES[form.goalType]?.label}
+              Afgestemd op: {calculated.goalLabel}
+              {calculated.effectiveDelta !== 0 && (
+                <> ({calculated.effectiveDelta > 0 ? '+' : ''}{calculated.effectiveDelta} kcal/dag)</>
+              )}
             </p>
           </div>
         </div>
@@ -3302,19 +3344,55 @@ function PersonalProfileCalculatorView({ profile, onSaveProfile, onNavigateDashb
               max={250}
               value={form.targetWeight || ''}
               placeholder="bijv. 78"
-              onChange={(e) => setForm({ ...form, targetWeight: e.target.value })}
+              onChange={(e) => handleBioChange('targetWeight', e.target.value)}
               className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-white font-bold text-base focus:outline-none focus:border-emerald-500"
             />
-            {(() => {
-              const weeks = weeksToTarget(form);
-              const w = Number(form.weight), t = Number(form.targetWeight);
-              if (weeks) return <p className="text-[11px] text-emerald-300 mt-1.5">Bij dit doel ben je er over ca. {weeks} weken ({Math.abs(w - t).toFixed(1)} kg).</p>;
-              if (t && w && (GOAL_TYPES[form.goalType]?.kcalDelta || 0) === 0 && Math.abs(w - t) >= 0.5)
-                return <p className="text-[11px] text-amber-300 mt-1.5">Kies hieronder afvallen of aankomen om richting je streefgewicht te gaan.</p>;
-              if (t && w && Math.abs(w - t) >= 0.5 && !weeks)
-                return <p className="text-[11px] text-amber-300 mt-1.5">Je streefgewicht past niet bij het gekozen doel hieronder.</p>;
-              return null;
-            })()}
+            {Number(form.targetWeight) > 0 && Math.abs(Number(form.weight) - Number(form.targetWeight)) >= 0.5 && (
+              <div className="mt-3 pt-3 border-t border-slate-800 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <label className="text-xs text-slate-300 font-semibold">In hoeveel weken wil je het halen?</label>
+                  {form.targetWeeks ? (
+                    <button type="button" onClick={() => handleBioChange('targetWeeks', '')} className="text-[11px] text-slate-400 hover:text-white underline">
+                      Gebruik standaard tempo
+                    </button>
+                  ) : null}
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="number"
+                    min={1}
+                    max={156}
+                    value={form.targetWeeks || ''}
+                    placeholder={calculated.realisticWeeks ? String(calculated.realisticWeeks) : 'bijv. 12'}
+                    onChange={(e) => handleBioChange('targetWeeks', e.target.value)}
+                    className="w-24 bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-white font-bold text-base focus:outline-none focus:border-emerald-500"
+                  />
+                  <span className="text-xs text-slate-400">weken</span>
+                </div>
+                {(() => {
+                  const c = calculated;
+                  const w = Number(form.weight), t = Number(form.targetWeight);
+                  const kgWeek = c.effectiveDelta ? Math.abs(c.effectiveDelta * 7 / 7700).toFixed(2) : null;
+                  if (!form.targetWeeks) {
+                    if (c.realisticWeeks) return <p className="text-[11px] text-emerald-300">Met het gekozen doel ben je er over ca. {c.realisticWeeks} weken ({Math.abs(w - t).toFixed(1)} kg, ±{kgWeek} kg/week). Vul zelf minder weken in voor een strakker schema.</p>;
+                    return <p className="text-[11px] text-amber-300">Vul in hoeveel weken je wilt; dan past de app je calorieën en de AI hierop aan.</p>;
+                  }
+                  return (
+                    <div className="space-y-1.5">
+                      <p className="text-[11px] text-emerald-300">
+                        Nieuw dagdoel: <strong>{c.calorieGoal} kcal</strong> ({c.effectiveDelta > 0 ? '+' : ''}{c.effectiveDelta} kcal t.o.v. je verbranding, ±{kgWeek} kg/week) en {c.proteinGoal} g eiwit.
+                      </p>
+                      {c.paceLimited && (
+                        <p className="text-[11px] text-amber-300 bg-amber-500/10 border border-amber-500/20 rounded-lg p-2">
+                          ⚠️ {form.targetWeeks} weken zou {Math.abs(c.requestedDelta)} kcal per dag {c.requestedDelta < 0 ? 'tekort' : 'overschot'} vragen. Dat is niet veilig vol te houden, dus de app begrenst het.
+                          Haalbaar tempo: ca. <strong>{c.realisticWeeks} weken</strong>.
+                        </p>
+                      )}
+                    </div>
+                  );
+                })()}
+              </div>
+            )}
           </div>
           <div className="bg-slate-950 border border-slate-800 rounded-2xl p-3.5">
             <div className="text-xs text-slate-400 mb-1">Voedingsvoorkeuren / allergieën (optioneel)</div>
@@ -3332,6 +3410,9 @@ function PersonalProfileCalculatorView({ profile, onSaveProfile, onNavigateDashb
         {/* Doelstelling */}
         <div>
           <label className="block text-xs text-slate-400 mb-2">Wat is jouw persoonlijke doel?</label>
+          {Number(form.targetWeeks) > 0 && Number(form.targetWeight) > 0 && (
+            <p className="text-[11px] text-amber-300 mb-2">Je hebt een eigen tempo ingesteld bij je streefgewicht; dat gaat voor op de keuze hieronder.</p>
+          )}
           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2.5">
             {Object.entries(GOAL_TYPES).map(([key, item]) => (
               <button
