@@ -3,7 +3,29 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cut" />
-  <title>Meal Tracker</title>
+  <title>NutriPulse</title>
+  <link rel="manifest" href="manifest.json" />
+  <meta name="theme-color" content="#020617" />
+  <link rel="icon" type="image/png" sizes="192x192" href="icon-192.png" />
+  <link rel="apple-touch-icon" href="apple-touch-icon.png" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="NutriPulse" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <script>
+    // Vang het installatie-event direct op, ook als de app nog aan het laden is
+    window.__installPrompt = null;
+    window.addEventListener('beforeinstallprompt', function (e) {
+      e.preventDefault();
+      window.__installPrompt = e;
+      window.dispatchEvent(new Event('installprompt-ready'));
+    });
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', function () {
+        navigator.serviceWorker.register('sw.js').catch(function (err) { console.warn('SW fout:', err); });
+      });
+    }
+  </script>
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="importmap">
   {
@@ -748,12 +770,16 @@ function App() {
 
   // Luister naar PWA Installatie event (voor browsers zoals Chrome/Edge/Android)
   useEffect(() => {
-    const handleBeforeInstallPrompt = (e) => {
-      e.preventDefault();
-      setDeferredInstallPrompt(e);
+    // Event kan al afgevuurd zijn voordat de app geladen was
+    if (window.__installPrompt) setDeferredInstallPrompt(window.__installPrompt);
+    const handleReady = () => setDeferredInstallPrompt(window.__installPrompt);
+    const handleInstalled = () => { window.__installPrompt = null; setDeferredInstallPrompt(null); };
+    window.addEventListener('installprompt-ready', handleReady);
+    window.addEventListener('appinstalled', handleInstalled);
+    return () => {
+      window.removeEventListener('installprompt-ready', handleReady);
+      window.removeEventListener('appinstalled', handleInstalled);
     };
-    window.addEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
-    return () => window.removeEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
   }, []);
 
   const handleInstallPwa = async () => {
