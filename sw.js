@@ -1,5 +1,5 @@
 // Service worker: maakt de app installeerbaar en laat hem offline openen.
-const CACHE = 'nutripulse-v9';
+const CACHE = 'nutripulse-v10';
 const CORE = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', (e) => {

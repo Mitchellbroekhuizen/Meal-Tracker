@@ -131,7 +131,7 @@ try {
 // Gemini API-sleutel: wordt alleen lokaal op dit apparaat bewaard (niet in de repo)
 const API_KEY_STORAGE = 'nutripulse_gemini_key';
 const GEMINI_MODEL = 'gemini-3.5-flash';
-const APP_VERSION = '8';
+const APP_VERSION = '9';
 function getApiKey() {
   try { return localStorage.getItem(API_KEY_STORAGE) || ''; } catch (e) { return ''; }
 }
@@ -352,6 +352,76 @@ async function fetchWithRetry(url, options) {
   });
 }
 
+// ==========================================
+// GEDEELDE AI-CONTEXT: elke AI-functie weet wie je bent, wat je doel is en wat je vandaag al at
+// ==========================================
+let AI_CTX = { profile: null, todayStats: null, todayMeals: [] };
+function setAiContext(ctx) { AI_CTX = ctx; }
+
+const GOAL_GUIDANCE = {
+  cut_fast: `DOEL = AFVALLEN (ca. 500 kcal tekort per dag, ±0,5 kg per week).
+  - Blijf binnen het resterende caloriebudget van vandaag; reken altijd kcal en eiwit door.
+  - Kies eiwitrijk (verzadiging en spierbehoud), veel groente, vezels en volume met een lage energiedichtheid.
+  - Beperk suiker, frituur, romige sauzen, grote hoeveelheden kaas/olie, alcohol en calorierijke dranken.
+  - Noem waar zinvol een concrete lichtere ruil of kleinere portie (bijv. magere kwark i.p.v. volle yoghurt).
+  - Wees eerlijk als iets slecht in het budget past, maar nooit streng of schuldig makend. Adviseer nooit maaltijden over te slaan of onder het veilige minimum te eten.`,
+  cut_mild: `DOEL = RUSTIG AFVALLEN (ca. 250 kcal tekort per dag, ±0,25 kg per week).
+  - Blijf ongeveer binnen het resterende caloriebudget; eiwitrijk, veel groente en vezels.
+  - Wees flexibel: kleine ruilen en porties bijstellen in plaats van dingen verbieden.
+  - Adviseer nooit maaltijden over te slaan.`,
+  maintain: `DOEL = OP GEWICHT BLIJVEN.
+  - Mik op het dagdoel, gebalanceerd verdeeld over de dag, met voldoende eiwit en groente.`,
+  lean_bulk: `DOEL = DROGE SPIERMASSA (ca. 250 kcal overschot per dag).
+  - Zorg dat het dagdoel gehaald wordt, met veel eiwit (verdeeld over 4-5 momenten) en voldoende koolhydraten rond het sporten.
+  - Voorkeur voor voedzame, onbewerkte bronnen.`,
+  bulk: `DOEL = AANKOMEN / SPIERGROEI (ca. 500 kcal overschot per dag).
+  - Help het hoge dagdoel te halen: energierijke maar voedzame keuzes (noten, olijfolie, volkoren, zuivel) en extra tussendoortjes.
+  - Ruim eiwit verdeeld over de dag. Geef aan als er nog veel calorieën open staan.`
+};
+
+// Hoeveel weken tot streefgewicht (7700 kcal ≈ 1 kg)
+function weeksToTarget(profile) {
+  const w = Number(profile?.weight), t = Number(profile?.targetWeight);
+  const delta = GOAL_TYPES[profile?.goalType]?.kcalDelta || 0;
+  if (!w || !t || !delta || Math.abs(w - t) < 0.5) return null;
+  if ((delta < 0 && t >= w) || (delta > 0 && t <= w)) return null; // doel en richting passen niet bij elkaar
+  return Math.ceil((Math.abs(w - t) * 7700) / (Math.abs(delta) * 7));
+}
+
+function buildAiContext() {
+  const p = AI_CTX.profile;
+  if (!p) return '';
+  const s = AI_CTX.todayStats || { calories: 0, protein: 0, carbs: 0, fat: 0, water: 0 };
+  const meals = AI_CTX.todayMeals || [];
+  const goalKey = GOAL_TYPES[p.goalType] ? p.goalType : 'maintain';
+  const left = {
+    kcal: Math.round((p.calorieGoal || 0) - s.calories),
+    protein: Math.round((p.proteinGoal || 0) - s.protein),
+    carbs: Math.round((p.carbsGoal || 0) - s.carbs),
+    fat: Math.round((p.fatGoal || 0) - s.fat)
+  };
+  const weeks = weeksToTarget(p);
+  const now = new Date();
+  const time = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+  return `
+=== GEBRUIKERSPROFIEL (houd hier altijd rekening mee) ===
+- ${p.gender === 'female' ? 'Vrouw' : 'Man'}, ${p.age} jaar, ${p.weight} kg, ${p.height} cm${p.targetWeight ? `, streefgewicht ${p.targetWeight} kg` : ''}${weeks ? ` (nog ca. ${weeks} weken bij dit tempo)` : ''}
+- Doel: ${GOAL_TYPES[goalKey].label}
+- Werk: ${WORK_ACTIVITY_LEVELS[p.workActivity]?.label || p.lifestyleType}; sport ${p.workoutsPerWeek}x per week${p.workoutTime ? `, vandaag om ${p.workoutTime}` : ''}
+- Dagritme: op om ${p.wakeTime}, slapen om ${p.sleepTime}. Het is nu ${time}.
+- Voedingsvoorkeuren/allergieën: ${p.foodPreferences?.trim() || 'geen opgegeven'}
+- Dagdoelen: ${p.calorieGoal} kcal, ${p.proteinGoal} g eiwit, ${p.carbsGoal} g koolhydraten, ${p.fatGoal} g vet, ${p.waterGoal} ml water
+- Vandaag al gegeten: ${Math.round(s.calories)} kcal, ${Math.round(s.protein)} g eiwit, ${Math.round(s.carbs)} g kh, ${Math.round(s.fat)} g vet; water ${s.water} ml
+- Maaltijden vandaag: ${meals.length ? meals.map(m => `${m.time || ''} ${m.mealType}: ${m.mealName} (${m.calories} kcal)`).join('; ') : 'nog niets'}
+- NOG OVER VANDAAG: ${left.kcal} kcal, ${left.protein} g eiwit, ${left.carbs} g kh, ${left.fat} g vet
+
+${GOAL_GUIDANCE[goalKey]}
+Respecteer de voedingsvoorkeuren/allergieën altijd. Antwoord in het Nederlands.
+=== EINDE PROFIEL ===
+`;
+}
+
+
 // 1. Analyseer Foto van Maaltijd
 async function analyzeMealImageWithGemini(base64Data, mimeType = "image/jpeg", extraNote = "") {
   const apiUrl = geminiUrl();
@@ -359,7 +429,9 @@ async function analyzeMealImageWithGemini(base64Data, mimeType = "image/jpeg", e
   const prompt = `Je bent een deskundige Nederlandse diëtist en voedingswetenschapper. Analyseer deze foto van een maaltijd of snack. 
   ${extraNote ? `Extra context van de gebruiker: "${extraNote}".` : ''}
   Herken alle ingrediënten op het bord/in beeld, schat het portiegewicht zo nauwkeurig mogelijk in, en bereken de totale voedingswaarde.
-  Geef het antwoord uitsluitend terug volgens het opgegeven JSON schema in het Nederlands.`;
+  Geef in healthTip en goalFit advies dat past bij het doel van de gebruiker hieronder.
+  Geef het antwoord uitsluitend terug volgens het opgegeven JSON schema in het Nederlands.
+  ${buildAiContext()}`;
 
   const payload = {
     contents: [{
@@ -386,12 +458,13 @@ async function analyzeMealImageWithGemini(base64Data, mimeType = "image/jpeg", e
             description: "Lijst met gedetecteerde ingrediënten en hun geschatte gewicht"
           },
           healthTip: { type: "STRING", description: "Een korte, positieve voedingstip over deze maaltijd (1-2 zinnen)" },
+          goalFit: { type: "STRING", description: "1-2 zinnen: hoe past deze maaltijd bij het doel en het resterende budget van vandaag, met een concrete betere ruil of portietip als dat zinvol is" },
           suggestedMealType: { 
             type: "STRING", 
             description: "Kies uit: Ontbijt, Lunch, Avondeten, Tussendoortje" 
           }
         },
-        propertyOrdering: ["mealName", "estimatedPortion", "calories", "protein", "carbs", "fat", "detectedItems", "healthTip", "suggestedMealType"]
+        propertyOrdering: ["mealName", "estimatedPortion", "calories", "protein", "carbs", "fat", "detectedItems", "healthTip", "goalFit", "suggestedMealType"]
       }
     }
   };
@@ -412,7 +485,9 @@ async function analyzeMealTextWithGemini(description) {
   const apiUrl = geminiUrl();
   
   const prompt = `Je bent een Nederlandse voedingsdeskundige. Bereken de voedingswaarden voor de volgende gegeten of gedronken items: "${description}".
-  Schat standaard Nederlandse portiegroottes in als die niet expliciet vermeld zijn.`;
+  Schat standaard Nederlandse portiegroottes in als die niet expliciet vermeld zijn.
+  Geef in healthTip en goalFit advies dat past bij het doel van de gebruiker hieronder.
+  ${buildAiContext()}`;
 
   const payload = {
     contents: [{ role: "user", parts: [{ text: prompt }] }],
@@ -429,9 +504,10 @@ async function analyzeMealTextWithGemini(description) {
           fat: { type: "NUMBER" },
           detectedItems: { type: "ARRAY", items: { type: "STRING" } },
           healthTip: { type: "STRING" },
+          goalFit: { type: "STRING", description: "1-2 zinnen: hoe past deze maaltijd bij het doel en het resterende budget van vandaag, met een concrete betere ruil of portietip als dat zinvol is" },
           suggestedMealType: { type: "STRING" }
         },
-        propertyOrdering: ["mealName", "estimatedPortion", "calories", "protein", "carbs", "fat", "detectedItems", "healthTip", "suggestedMealType"]
+        propertyOrdering: ["mealName", "estimatedPortion", "calories", "protein", "carbs", "fat", "detectedItems", "healthTip", "goalFit", "suggestedMealType"]
       }
     }
   };
@@ -455,22 +531,10 @@ async function getLiveCoachAdvice(profile, todayStats, loggedMeals, currentTimeS
     ? loggedMeals.map(m => `${m.time} (${m.mealType}): ${m.mealName} (${m.calories} kcal, ${m.protein}g E)`).join('; ')
     : 'Nog niets gegeten vandaag.';
 
-  const prompt = `Je bent een persoonlijke Nederlandse Leefstijl & Voedingscoach. 
-  Het is nu ${currentTimeStr}.
-  Persoonlijk Profiel & Lichaamsgegevens:
-  - Geslacht: ${profile.gender === 'female' ? 'Vrouw' : 'Man'}, Leeftijd: ${profile.age} jaar, Gewicht: ${profile.weight} kg, Lengte: ${profile.height} cm
-  - Fysiek Doel: ${profile.goalType}
-  - Dagritme: Opstaan ${profile.wakeTime}, Slapen ${profile.sleepTime}
-  - Werk & Dagelijkse Activiteit: ${profile.workActivity} (${profile.lifestyleType})
-  - Sportfrequentie: ${profile.workoutsPerWeek}x per week (Sporttijd vandaag: ${profile.workoutTime || 'Geen specifieke tijd'})
-  - Persoonlijke Dagdoelen: ${profile.calorieGoal} kcal, ${profile.proteinGoal}g eiwit, ${profile.carbsGoal}g koolhydraten, ${profile.fatGoal}g vet, ${profile.waterGoal}ml water.
-  
-  Status van vandaag tot nu toe:
-  - Gegeten: ${todayStats.calories} kcal, ${todayStats.protein}g eiwit, ${todayStats.carbs}g koolhydraten, ${todayStats.fat}g vet.
-  - Water gedronken: ${todayStats.water} ml.
-  - Gelogde maaltijden vandaag: ${mealSummary}
-
-  Geef concreet, motiverend advies voor DIT specifieke tijdstip op basis van hun persoonlijke lichaam, werk en dagelijkse leven.`;
+  const prompt = `Je bent een persoonlijke Nederlandse Leefstijl & Voedingscoach.
+  ${buildAiContext()}
+  Geef concreet, motiverend advies voor DIT specifieke tijdstip (${currentTimeStr}), passend bij het doel, het resterende budget en hun dagritme.
+  De concrete suggesties moeten samen binnen het resterende budget passen en de voorkeuren respecteren.`;
 
   const payload = {
     contents: [{ role: "user", parts: [{ text: prompt }] }],
@@ -489,10 +553,13 @@ async function getLiveCoachAdvice(profile, todayStats, loggedMeals, currentTimeS
               properties: {
                 title: { type: "STRING" },
                 why: { type: "STRING" },
+                mealType: { type: "STRING", description: "Ontbijt, Lunch, Avondeten of Tussendoortje" },
                 calories: { type: "NUMBER" },
-                protein: { type: "NUMBER" }
+                protein: { type: "NUMBER" },
+                carbs: { type: "NUMBER" },
+                fat: { type: "NUMBER" }
               },
-              propertyOrdering: ["title", "why", "calories", "protein"]
+              propertyOrdering: ["title", "why", "mealType", "calories", "protein", "carbs", "fat"]
             },
             description: "2 of 3 concrete snack- of maaltijdopties die passen bij de resterende macro's"
           },
@@ -520,8 +587,10 @@ async function generateRecipesWithGemini(query, remainingMacros, filterTag) {
   const prompt = `Genereer 3 heerlijke, gezonde en praktisch te bereiden Nederlandse recepten.
   Zoekopdracht van gebruiker: "${query || 'Verras me met gezonde maaltijden'}"
   Specifieke voorkeur/filter: "${filterTag || 'Geen'}"
-  Resterende macro's van de gebruiker voor vandaag: ca. ${Math.max(300, remainingMacros.calories)} kcal en ${Math.max(20, remainingMacros.protein)}g eiwit.
-  Zorg dat de recepten goed verkrijgbare ingrediënten uit de Nederlandse supermarkt bevatten.`;
+  Zorg dat de recepten goed verkrijgbare ingrediënten uit de Nederlandse supermarkt bevatten.
+  Stem porties, ingrediënten en bereiding af op het doel van de gebruiker. Bij "Passend bij mijn dag": laat elk recept passen binnen wat er nog over is vandaag (minimaal ca. ${Math.max(300, remainingMacros.calories)} kcal beschikbaar).
+  Voeg in de tags altijd een korte doel-tag toe (bijv. "Past bij afvallen", "Eiwitrijk", "Bulk-proof").
+  ${buildAiContext()}`;
 
   const payload = {
     contents: [{ role: "user", parts: [{ text: prompt }] }],
@@ -568,6 +637,57 @@ async function generateRecipesWithGemini(query, remainingMacros, filterTag) {
   });
 
   const text = result?.candidates?.[0]?.content?.parts?.[0]?.text;
+  return JSON.parse(text);
+}
+
+// 5. AI Dagmenu: rest van de dag invullen passend bij doel en budget
+async function generateDayMenuWithGemini(wish) {
+  const apiUrl = geminiUrl();
+  const prompt = `Je bent een Nederlandse diëtist. Stel een concreet menu samen voor de REST VAN VANDAAG.
+  - Plan alleen eetmomenten die nog moeten komen (kijk naar het huidige tijdstip, dagritme, sporttijd en wat al gegeten is).
+  - Het totaal moet zo goed mogelijk aansluiten op wat er NOG OVER is aan kcal en eiwit (niet erboven bij afvallen, niet ver eronder bij aankomen).
+  - Gebruik gewone producten uit de Nederlandse supermarkt, met hoeveelheden in grammen of stuks.
+  ${wish ? `Extra wens van de gebruiker: "${wish}"` : ''}
+  ${buildAiContext()}`;
+
+  const payload = {
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    generationConfig: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: "OBJECT",
+        properties: {
+          summary: { type: "STRING", description: "1-2 zinnen: waarom dit menu past bij het doel en budget" },
+          meals: {
+            type: "ARRAY",
+            items: {
+              type: "OBJECT",
+              properties: {
+                time: { type: "STRING", description: "Tijdstip, bijv. 18:30" },
+                mealType: { type: "STRING", description: "Ontbijt, Lunch, Avondeten of Tussendoortje" },
+                title: { type: "STRING" },
+                description: { type: "STRING", description: "Wat eet je precies, met hoeveelheden" },
+                calories: { type: "NUMBER" },
+                protein: { type: "NUMBER" },
+                carbs: { type: "NUMBER" },
+                fat: { type: "NUMBER" }
+              },
+              propertyOrdering: ["time", "mealType", "title", "description", "calories", "protein", "carbs", "fat"]
+            }
+          }
+        },
+        propertyOrdering: ["summary", "meals"]
+      }
+    }
+  };
+
+  const result = await fetchWithRetry(apiUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  const text = result?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) throw new Error("Kon geen dagmenu maken.");
   return JSON.parse(text);
 }
 
@@ -830,6 +950,12 @@ function generateSmartSchedule(profile, todayStats, loggedMeals) {
   const hasLunch = loggedMeals.some(m => m.mealType === "Lunch");
   const hasDinner = loggedMeals.some(m => m.mealType === "Avondeten");
   const hasSnack = loggedMeals.some(m => m.mealType === "Tussendoortje");
+  const goalDelta = GOAL_TYPES[profile.goalType]?.kcalDelta || 0;
+  const goalHint = goalDelta < 0
+    ? ' Afvallen: vul je bord voor de helft met groente en houd sauzen en olie beperkt.'
+    : goalDelta > 0
+    ? ' Aankomen: neem gerust een extra portie of een calorierijke toevoeging zoals noten of olijfolie.'
+    : '';
 
   const schedule = [
     {
@@ -848,7 +974,7 @@ function generateSmartSchedule(profile, todayStats, loggedMeals) {
       type: "meal",
       mealCategory: "Ontbijt",
       title: "Eiwitrijk Ontbijt",
-      advice: `Richt op ~${Math.round(profile.proteinGoal * 0.25)}g eiwit en complexe vezels zodat je geen ochtenddip krijgt.`,
+      advice: `Richt op ~${Math.round(profile.calorieGoal * 0.25)} kcal en ~${Math.round(profile.proteinGoal * 0.25)}g eiwit met complexe vezels zodat je geen ochtenddip krijgt.${goalHint}`,
       completed: hasBreakfast
     },
     {
@@ -867,7 +993,7 @@ function generateSmartSchedule(profile, todayStats, loggedMeals) {
       type: "meal",
       mealCategory: "Lunch",
       title: "Energieke Lunch",
-      advice: "Combineer langzame koolhydraten met magere eiwitten en groenten voor blijvende focus in de middag.",
+      advice: `Richt op ~${Math.round(profile.calorieGoal * 0.3)} kcal: combineer langzame koolhydraten met magere eiwitten en groenten voor blijvende focus.${goalHint}`,
       completed: hasLunch
     },
     {
@@ -898,7 +1024,7 @@ function generateSmartSchedule(profile, todayStats, loggedMeals) {
       type: "meal",
       mealCategory: "Avondeten",
       title: "Herstellend Avondeten",
-      advice: `Focus op verse groenten, ~${Math.round(profile.proteinGoal * 0.35)}g eiwit en een gebalanceerde portie koolhydraten.`,
+      advice: `Richt op ~${Math.round(profile.calorieGoal * 0.32)} kcal: verse groenten, ~${Math.round(profile.proteinGoal * 0.35)}g eiwit en een gebalanceerde portie koolhydraten.${goalHint}`,
       completed: hasDinner
     },
     {
@@ -1370,6 +1496,9 @@ function App() {
     };
   }, [todayMeals, dailyWaterMap, todayKey]);
 
+  // Geef de AI altijd de actuele stand van zaken mee
+  setAiContext({ profile, todayStats, todayMeals });
+
   const smartSchedule = useMemo(() => {
     return generateSmartSchedule(profile, todayStats, todayMeals);
   }, [profile, todayStats, todayMeals]);
@@ -1768,6 +1897,11 @@ function DashboardView({ selectedDate, setSelectedDate, stats, profile, meals, o
               <span className="text-[11px] bg-emerald-500/10 text-emerald-300 px-2.5 py-0.5 rounded-full border border-emerald-500/20">
                 {GOAL_TYPES[profile.goalType]?.label || 'Persoonlijk Doel'}
               </span>
+              {profile.targetWeight && weeksToTarget(profile) && (
+                <span className="text-[11px] bg-amber-500/10 text-amber-300 px-2.5 py-0.5 rounded-full border border-amber-500/20">
+                  🎯 {profile.targetWeight} kg over ~{weeksToTarget(profile)} wk
+                </span>
+              )}
               <button
                 onClick={() => onNavigate('profile')}
                 className="text-[11px] text-emerald-400 hover:underline font-semibold flex items-center gap-0.5"
@@ -2142,7 +2276,7 @@ function LogMealView({ selectedDate, onSaveMeal, showToast }) {
         protein: result.protein || 0,
         carbs: result.carbs || 0,
         fat: result.fat || 0,
-        healthTip: result.healthTip || ""
+        healthTip: [result.healthTip, result.goalFit].filter(Boolean).join(' ')
       });
       showToast("Foto succesvol geanalyseerd door AI! ✨");
     } catch (err) {
@@ -2169,7 +2303,7 @@ function LogMealView({ selectedDate, onSaveMeal, showToast }) {
         protein: result.protein || 0,
         carbs: result.carbs || 0,
         fat: result.fat || 0,
-        healthTip: result.healthTip || ""
+        healthTip: [result.healthTip, result.goalFit].filter(Boolean).join(' ')
       });
       showToast("Voedingswaarde berekend!");
     } catch (err) {
@@ -2390,6 +2524,12 @@ function LogMealView({ selectedDate, onSaveMeal, showToast }) {
               💡 <strong>Coach Tip:</strong> {analysisResult.healthTip}
             </p>
           )}
+
+          {analysisResult.goalFit && (
+            <p className="text-xs text-amber-200 bg-amber-500/10 p-3 rounded-xl border border-amber-500/20">
+              🎯 <strong>Past dit bij je doel?</strong> {analysisResult.goalFit}
+            </p>
+          )}
         </div>
       )}
 
@@ -2519,6 +2659,24 @@ function LifestyleCoachView({
   const [showSettings, setShowSettings] = useState(false);
   const [aiAdvice, setAiAdvice] = useState(null);
   const [loadingAdvice, setLoadingAdvice] = useState(false);
+  const [dayMenu, setDayMenu] = useState(null);
+  const [loadingMenu, setLoadingMenu] = useState(false);
+  const [menuWish, setMenuWish] = useState("");
+  const [loggedMenuItems, setLoggedMenuItems] = useState({});
+
+  const handleGenerateDayMenu = async () => {
+    setLoadingMenu(true);
+    try {
+      const result = await generateDayMenuWithGemini(menuWish.trim());
+      setDayMenu(result);
+      setLoggedMenuItems({});
+    } catch (err) {
+      console.error(err);
+      showToast(aiErrorMessage(err, "Kon even geen dagmenu maken.").replace(" (bovenaan dit scherm)", " (via Maaltijd toevoegen → Typ & Bereken)"), "error");
+    } finally {
+      setLoadingMenu(false);
+    }
+  };
 
   useEffect(() => {
     setEditProfile(profile);
@@ -2564,7 +2722,7 @@ function LifestyleCoachView({
               Wat en wanneer kan ik nu het beste eten?
             </h2>
             <p className="text-xs sm:text-sm text-slate-300">
-              Afgestemd op jouw profiel ({profile.gender === 'female' ? 'Vrouw' : 'Man'}, {profile.age}j, {profile.weight}kg), jouw werk ({WORK_ACTIVITY_LEVELS[profile.workActivity]?.label || profile.lifestyleType}) en je resterende macro's.
+              Afgestemd op jouw doel ({GOAL_TYPES[profile.goalType]?.label || 'persoonlijk doel'}), profiel ({profile.gender === 'female' ? 'Vrouw' : 'Man'}, {profile.age}j, {profile.weight}kg), jouw werk ({WORK_ACTIVITY_LEVELS[profile.workActivity]?.label || profile.lifestyleType}) en je resterende macro's.
             </p>
           </div>
 
@@ -2621,11 +2779,11 @@ function LifestyleCoachView({
                         <button
                           onClick={() => onQuickLogMeal({
                             mealName: sug.title,
-                            mealType: "Tussendoortje",
+                            mealType: ["Ontbijt", "Lunch", "Avondeten", "Tussendoortje"].includes(sug.mealType) ? sug.mealType : "Tussendoortje",
                             calories: sug.calories,
                             protein: sug.protein,
-                            carbs: Math.round((sug.calories - sug.protein * 4) / 8),
-                            fat: Math.round((sug.calories - sug.protein * 4) / 18),
+                            carbs: sug.carbs ?? Math.round((sug.calories - sug.protein * 4) / 8),
+                            fat: sug.fat ?? Math.round((sug.calories - sug.protein * 4) / 18),
                             estimatedPortion: "1 coach-portie"
                           })}
                           className="text-xs bg-emerald-500/20 hover:bg-emerald-500 text-emerald-300 hover:text-slate-950 font-semibold px-2.5 py-1 rounded-lg transition"
@@ -2637,6 +2795,85 @@ function LifestyleCoachView({
                   ))}
                 </div>
               </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* AI DAGMENU VOOR DE REST VAN VANDAAG */}
+      <div className="bg-slate-900 border border-slate-800 rounded-3xl p-5 sm:p-6 space-y-4">
+        <div>
+          <span className="text-xs font-bold uppercase tracking-wider text-emerald-400 flex items-center gap-1.5">
+            <ChefHat className="w-4 h-4" /> AI Dagmenu
+          </span>
+          <h2 className="text-lg sm:text-xl font-bold text-white mt-1">Wat eet ik de rest van vandaag?</h2>
+          <p className="text-xs text-slate-400 mt-1">
+            Een compleet menu dat past bij je doel ({GOAL_TYPES[profile.goalType]?.label || 'persoonlijk doel'}) en de{' '}
+            <span className="text-emerald-400 font-semibold">{Math.max(0, Math.round((profile.calorieGoal || 0) - todayStats.calories))} kcal</span> die je nog over hebt.
+          </p>
+        </div>
+        <div className="flex flex-col sm:flex-row gap-2">
+          <input
+            type="text"
+            value={menuWish}
+            onChange={(e) => setMenuWish(e.target.value)}
+            placeholder="Optioneel: bijv. 'ik heb kip en broccoli in huis'"
+            className="flex-1 min-w-0 bg-slate-950 border border-slate-700 rounded-xl px-3 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500"
+          />
+          <button
+            onClick={handleGenerateDayMenu}
+            disabled={loadingMenu}
+            className="bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-bold text-sm px-5 py-2.5 rounded-xl flex items-center justify-center gap-2 shrink-0 transition"
+          >
+            {loadingMenu ? <><RefreshCw className="w-4 h-4 animate-spin" /> Menu maken...</> : <><Sparkles className="w-4 h-4" /> Maak dagmenu</>}
+          </button>
+        </div>
+
+        {dayMenu && (
+          <div className="space-y-3 pt-1">
+            {dayMenu.summary && (
+              <p className="text-xs text-emerald-300 bg-emerald-500/10 p-3 rounded-xl border border-emerald-500/20">🎯 {dayMenu.summary}</p>
+            )}
+            {(dayMenu.meals || []).map((m, idx) => (
+              <div key={idx} className="bg-slate-950 border border-slate-800 rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div className="flex items-start gap-3">
+                  <div className="px-2.5 py-1.5 rounded-xl font-mono text-xs font-bold shrink-0 bg-amber-500/15 text-amber-400">{m.time}</div>
+                  <div>
+                    <div className="text-[11px] uppercase tracking-wider text-slate-500 font-semibold">{m.mealType}</div>
+                    <h4 className="font-bold text-white text-sm">{m.title}</h4>
+                    <p className="text-xs text-slate-400 mt-1 leading-relaxed">{m.description}</p>
+                    <p className="text-xs mt-1.5">
+                      <span className="text-emerald-400 font-bold">{Math.round(m.calories)} kcal</span>
+                      <span className="text-slate-400"> • {Math.round(m.protein)}g E • {Math.round(m.carbs)}g K • {Math.round(m.fat)}g V</span>
+                    </p>
+                  </div>
+                </div>
+                <button
+                  disabled={!!loggedMenuItems[idx]}
+                  onClick={() => {
+                    onQuickLogMeal({
+                      mealName: m.title,
+                      mealType: ["Ontbijt", "Lunch", "Avondeten", "Tussendoortje"].includes(m.mealType) ? m.mealType : "Tussendoortje",
+                      calories: Math.round(m.calories),
+                      protein: Math.round(m.protein),
+                      carbs: Math.round(m.carbs),
+                      fat: Math.round(m.fat),
+                      estimatedPortion: "1 portie (AI dagmenu)",
+                      healthTip: m.description
+                    });
+                    setLoggedMenuItems({ ...loggedMenuItems, [idx]: true });
+                  }}
+                  className="self-end sm:self-center shrink-0 text-xs bg-emerald-500/20 hover:bg-emerald-500 disabled:bg-slate-800 disabled:text-slate-500 text-emerald-300 hover:text-slate-950 font-semibold px-3 py-2 rounded-xl transition"
+                >
+                  {loggedMenuItems[idx] ? '✓ Gelogd' : '+ Gegeten'}
+                </button>
+              </div>
+            ))}
+            {(dayMenu.meals || []).length > 0 && (
+              <p className="text-xs text-slate-400 text-right">
+                Totaal menu: <span className="text-white font-semibold">{Math.round(dayMenu.meals.reduce((a, m) => a + (Number(m.calories) || 0), 0))} kcal</span>
+                {' '}• {Math.round(dayMenu.meals.reduce((a, m) => a + (Number(m.protein) || 0), 0))}g eiwit
+              </p>
             )}
           </div>
         )}
@@ -3048,6 +3285,47 @@ function PersonalProfileCalculatorView({ profile, onSaveProfile, onNavigateDashb
                 {num === 6 ? '6+' : `${num}x`}
               </button>
             ))}
+          </div>
+        </div>
+
+        {/* Streefgewicht & voorkeuren */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div className="bg-slate-950 border border-slate-800 rounded-2xl p-3.5">
+            <div className="flex justify-between text-xs mb-1">
+              <span className="text-slate-400">Streefgewicht (optioneel)</span>
+              {form.targetWeight ? <span className="font-bold text-emerald-400">{form.targetWeight} kg</span> : null}
+            </div>
+            <input
+              type="number"
+              step="0.5"
+              min={35}
+              max={250}
+              value={form.targetWeight || ''}
+              placeholder="bijv. 78"
+              onChange={(e) => setForm({ ...form, targetWeight: e.target.value })}
+              className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-white font-bold text-base focus:outline-none focus:border-emerald-500"
+            />
+            {(() => {
+              const weeks = weeksToTarget(form);
+              const w = Number(form.weight), t = Number(form.targetWeight);
+              if (weeks) return <p className="text-[11px] text-emerald-300 mt-1.5">Bij dit doel ben je er over ca. {weeks} weken ({Math.abs(w - t).toFixed(1)} kg).</p>;
+              if (t && w && (GOAL_TYPES[form.goalType]?.kcalDelta || 0) === 0 && Math.abs(w - t) >= 0.5)
+                return <p className="text-[11px] text-amber-300 mt-1.5">Kies hieronder afvallen of aankomen om richting je streefgewicht te gaan.</p>;
+              if (t && w && Math.abs(w - t) >= 0.5 && !weeks)
+                return <p className="text-[11px] text-amber-300 mt-1.5">Je streefgewicht past niet bij het gekozen doel hieronder.</p>;
+              return null;
+            })()}
+          </div>
+          <div className="bg-slate-950 border border-slate-800 rounded-2xl p-3.5">
+            <div className="text-xs text-slate-400 mb-1">Voedingsvoorkeuren / allergieën (optioneel)</div>
+            <input
+              type="text"
+              value={form.foodPreferences || ''}
+              placeholder="bijv. geen vis, lactosevrij, houd van Aziatisch"
+              onChange={(e) => setForm({ ...form, foodPreferences: e.target.value })}
+              className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-white text-sm focus:outline-none focus:border-emerald-500"
+            />
+            <p className="text-[11px] text-slate-500 mt-1.5">De AI houdt hier rekening mee bij menu's, recepten en advies.</p>
           </div>
         </div>
 
