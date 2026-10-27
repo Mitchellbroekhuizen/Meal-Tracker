@@ -131,7 +131,7 @@ try {
 // Gemini API-sleutel: wordt alleen lokaal op dit apparaat bewaard (niet in de repo)
 const API_KEY_STORAGE = 'nutripulse_gemini_key';
 const GEMINI_MODEL = 'gemini-flash-latest';
-const APP_VERSION = '4';
+const APP_VERSION = '5';
 function getApiKey() {
   try { return localStorage.getItem(API_KEY_STORAGE) || ''; } catch (e) { return ''; }
 }
@@ -155,6 +155,23 @@ function aiErrorMessage(err, fallback) {
   if (msg === 'TIMEOUT') return 'Gemini reageert niet (time-out). Controleer je internet en probeer het opnieuw.';
   if (/API Fout/.test(msg)) return fallback + ' (' + msg.slice(0, 140) + ')';
   return fallback;
+}
+
+// Verklein een foto tot max. 1024px (scheelt megabytes en dus seconden)
+function shrinkImage(dataUrl, maxSize, quality) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, maxSize / Math.max(img.width, img.height));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(img.width * scale);
+      canvas.height = Math.round(img.height * scale);
+      canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+      resolve(canvas.toDataURL('image/jpeg', quality));
+    };
+    img.onerror = reject;
+    img.src = dataUrl;
+  });
 }
 
 // Invoerveld voor de API-sleutel
@@ -237,27 +254,55 @@ async function fetchOnce(url, options, timeoutMs) {
 }
 
 // Probeert meerdere Gemini-modellen: valt terug als een model niet bestaat, overbelast is of te traag is
-const GEMINI_FALLBACK_MODELS = ['gemini-flash-latest', 'gemini-2.5-flash', 'gemini-flash-lite-latest'];
+// Snelle modellen eerst, zonder lang "nadenken" (dat maakte het traag)
+const GEMINI_MODELS = [
+  { name: 'gemini-2.5-flash', thinking: { thinkingBudget: 0 } },
+  { name: 'gemini-flash-lite-latest', thinking: { thinkingBudget: 0 } },
+  { name: 'gemini-flash-latest', thinking: { thinkingLevel: 'low' } }
+];
+let preferredModelIndex = 0; // onthoudt welk model werkte
+
+function withThinking(options, thinking) {
+  try {
+    const body = JSON.parse(options.body);
+    body.generationConfig = { ...(body.generationConfig || {}) };
+    if (thinking) body.generationConfig.thinkingConfig = thinking;
+    else delete body.generationConfig.thinkingConfig;
+    return { ...options, body: JSON.stringify(body) };
+  } catch (e) {
+    return options;
+  }
+}
+
 async function fetchWithRetry(url, options) {
-  const isGemini = url.includes('generativelanguage.googleapis.com');
-  const urls = isGemini
-    ? GEMINI_FALLBACK_MODELS.map(m => url.replace(/models\/[^:]+:/, `models/${m}:`))
-    : [url];
+  if (!url.includes('generativelanguage.googleapis.com')) return fetchOnce(url, options, 30000);
+
+  const order = GEMINI_MODELS.map((_, i) => (i + preferredModelIndex) % GEMINI_MODELS.length);
   let lastErr = null;
-  for (const u of urls) {
+  for (const idx of order) {
+    const model = GEMINI_MODELS[idx];
+    const u = url.replace(/models\/[^:]+:/, `models/${model.name}:`);
+    let thinking = model.thinking;
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        return await fetchOnce(u, options, 30000);
+        const t0 = performance.now();
+        const res = await fetchOnce(u, withThinking(options, thinking), 25000);
+        console.info(`Gemini ${model.name}: ${Math.round(performance.now() - t0)} ms`);
+        preferredModelIndex = idx;
+        return res;
       } catch (err) {
         lastErr = err;
-        console.warn('Gemini aanvraag mislukt:', u.split('?')[0], err.message);
+        console.warn('Gemini aanvraag mislukt:', model.name, err.message);
         const s = err.status;
-        // Sleutel of verzoek klopt niet: direct stoppen
-        if (s === 400 || s === 401 || s === 403) throw err;
-        // Model bestaat niet of is te traag: meteen volgende model
-        if (s === 404 || s === 'timeout') break;
+        const msg = String(err.message || '');
+        // Model kent de denk-instelling niet: opnieuw zonder
+        if (s === 400 && /thinking/i.test(msg) && thinking) { thinking = null; continue; }
+        // Sleutel klopt niet: direct stoppen
+        if ((s === 400 || s === 401 || s === 403) && /key|API_KEY|permission/i.test(msg)) throw err;
+        // Model bestaat niet, weigert het verzoek of is te traag: volgende model
+        if (s === 400 || s === 404 || s === 'timeout') break;
         // Overbelast / limiet: kort wachten en nog één keer
-        if (attempt === 0) await new Promise(r => setTimeout(r, 1500));
+        if (attempt === 0) await new Promise(r => setTimeout(r, 1000));
       }
     }
   }
@@ -2025,8 +2070,9 @@ function LogMealView({ selectedDate, onSaveMeal, showToast }) {
     if (!file) return;
 
     const reader = new FileReader();
-    reader.onload = (event) => {
-      const dataUrl = event.target.result;
+    reader.onload = async (event) => {
+      let dataUrl = event.target.result;
+      try { dataUrl = await shrinkImage(dataUrl, 1024, 0.8); } catch (err) { console.warn('Verkleinen mislukt', err); }
       setImagePreview(dataUrl);
       const [header, base64] = dataUrl.split(',');
       const mimeMatch = header.match(/data:(.*);base64/);
