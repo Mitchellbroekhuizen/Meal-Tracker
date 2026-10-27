@@ -130,8 +130,8 @@ try {
 // ==========================================
 // Gemini API-sleutel: wordt alleen lokaal op dit apparaat bewaard (niet in de repo)
 const API_KEY_STORAGE = 'nutripulse_gemini_key';
-const GEMINI_MODEL = 'gemini-3.8-flash';
-const APP_VERSION = '7';
+const GEMINI_MODEL = 'gemini-3.5-flash';
+const APP_VERSION = '8';
 function getApiKey() {
   try { return localStorage.getItem(API_KEY_STORAGE) || ''; } catch (e) { return ''; }
 }
@@ -257,12 +257,15 @@ async function fetchOnce(url, options, timeoutMs) {
 // Probeert meerdere Gemini-modellen: valt terug als een model niet bestaat, overbelast is of te traag is
 // Snelle modellen eerst, zonder lang "nadenken"
 const GEMINI_MODELS = [
-  { name: 'gemini-3.8-flash', thinking: { thinkingLevel: 'minimal' } },
-  { name: 'gemini-3.5-flash-lite', thinking: { thinkingLevel: 'minimal' } },
-  { name: 'gemini-3.5-flash', thinking: { thinkingLevel: 'minimal' } },
-  { name: 'gemini-flash-latest', thinking: { thinkingLevel: 'minimal' } }
+  { name: 'gemini-3.5-flash', thinking: { thinkingLevel: 'minimal' } },     // getest: ~7 sec
+  { name: 'gemini-3.8-flash', thinking: { thinkingLevel: 'low' } },         // 'minimal' niet ondersteund
+  { name: 'gemini-3.5-flash-lite', thinking: { thinkingLevel: 'minimal' } } // werkt, maar traag
 ];
-let preferredModelIndex = 0; // onthoudt welk model het laatst werkte
+let preferredModelIndex = 0; // onthoudt welk model het laatst werkte (ook na herstart)
+try {
+  const saved = parseInt(localStorage.getItem('nutripulse_model_idx'), 10);
+  if (saved >= 0 && saved < GEMINI_MODELS.length) preferredModelIndex = saved;
+} catch (e) {}
 
 function tuneRequest(options, thinking) {
   try {
@@ -326,6 +329,7 @@ async function fetchWithRetry(url, options) {
       pending++;
       tryModel(url, options, idx, stop).then(({ res, idx }) => {
         preferredModelIndex = idx;
+        try { localStorage.setItem('nutripulse_model_idx', String(idx)); } catch (e) {}
         finish(resolve, res);
       }).catch((err) => {
         pending--;
@@ -342,7 +346,7 @@ async function fetchWithRetry(url, options) {
         }
       });
       clearTimeout(timer);
-      timer = setTimeout(startNext, 7000);
+      timer = setTimeout(startNext, 12000);
     };
     startNext();
   });
