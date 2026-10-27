@@ -131,6 +131,7 @@ try {
 // Gemini API-sleutel: wordt alleen lokaal op dit apparaat bewaard (niet in de repo)
 const API_KEY_STORAGE = 'nutripulse_gemini_key';
 const GEMINI_MODEL = 'gemini-flash-latest';
+const APP_VERSION = '4';
 function getApiKey() {
   try { return localStorage.getItem(API_KEY_STORAGE) || ''; } catch (e) { return ''; }
 }
@@ -170,7 +171,7 @@ function ApiKeyBox() {
   if (key && !editing) {
     return (
       <div className="flex items-center justify-between gap-3 text-xs text-slate-400 bg-slate-950 border border-slate-800 rounded-2xl px-4 py-2.5">
-        <span className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-400" /> AI-sleutel ingesteld (…{key.slice(-4)})</span>
+        <span className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-400" /> AI-sleutel ingesteld (…{key.slice(-4)}) · versie {APP_VERSION}</span>
         <button onClick={() => { setDraft(''); setEditing(true); }} className="text-emerald-400 hover:text-emerald-300 font-semibold">Wijzigen</button>
       </div>
     );

@@ -1,5 +1,5 @@
 // Service worker: maakt de app installeerbaar en laat hem offline openen.
-const CACHE = 'nutripulse-v3';
+const CACHE = 'nutripulse-v4';
 const CORE = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', (e) => {
@@ -23,7 +23,7 @@ self.addEventListener('fetch', (e) => {
   if (url.origin !== self.location.origin && !isCdn) return; // API-calls niet aanraken
 
   e.respondWith(
-    fetch(req)
+    fetch(url.origin === self.location.origin ? new Request(req, { cache: 'no-cache' }) : req)
       .then((res) => {
         if (res && (res.ok || res.type === 'opaque')) {
           const copy = res.clone();
