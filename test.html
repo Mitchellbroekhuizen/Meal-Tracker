@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>NutriPulse test</title>
+<style>
+  body { margin: 0; padding: 16px; background: #020617; color: #e2e8f0; font: 14px/1.45 system-ui, sans-serif; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  p { color: #94a3b8; margin: 0 0 14px; }
+  button { width: 100%; padding: 14px; border: 0; border-radius: 14px; background: #10b981; color: #020617; font-weight: 700; font-size: 15px; }
+  button:disabled { opacity: .5; }
+  .row { background: #0f172a; border: 1px solid #1e293b; border-radius: 12px; padding: 10px 12px; margin-top: 8px; word-break: break-word; }
+  .ok { color: #34d399; } .bad { color: #f87171; } .wait { color: #fbbf24; }
+  small { color: #64748b; }
+</style>
+</head>
+<body>
+  <h1>Gemini verbindingstest</h1>
+  <p>Gebruikt de sleutel die in de app is opgeslagen. Tik op start en maak daarna een screenshot.</p>
+  <button id="go">Start test</button>
+  <div id="out"></div>
+<script>
+const out = document.getElementById('out');
+const line = (html) => { const d = document.createElement('div'); d.className = 'row'; d.innerHTML = html; out.appendChild(d); return d; };
+const esc = (s) => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+async function timed(url, opts, ms) {
+  const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), ms); const t0 = performance.now();
+  try {
+    const r = await fetch(url, { ...opts, signal: ctrl.signal });
+    const txt = await r.text();
+    return { status: r.status, ms: Math.round(performance.now() - t0), txt };
+  } catch (e) {
+    return { status: e.name === 'AbortError' ? 'TIME-OUT' : 'NETWERKFOUT', ms: Math.round(performance.now() - t0), txt: e.message };
+  } finally { clearTimeout(t); }
+}
+
+document.getElementById('go').onclick = async () => {
+  const btn = document.getElementById('go'); btn.disabled = true; out.innerHTML = '';
+  let key = ''; try { key = localStorage.getItem('nutripulse_gemini_key') || ''; } catch (e) {}
+  line(`Sleutel: ${key ? '<span class="ok">gevonden</span> (…' + esc(key.slice(-4)) + ', ' + key.length + ' tekens)' : '<span class="bad">niet gevonden</span>'}<br><small>${esc(navigator.userAgent)}</small>`);
+  if (!key) { btn.disabled = false; return; }
+
+  // 1. Welke modellen mag deze sleutel gebruiken?
+  const l = line('<span class="wait">Modellen ophalen…</span>');
+  const list = await timed(`https://generativelanguage.googleapis.com/v1beta/models?pageSize=200&key=${encodeURIComponent(key)}`, {}, 20000);
+  let names = [];
+  try { names = JSON.parse(list.txt).models.filter(m => (m.supportedGenerationMethods || []).includes('generateContent')).map(m => m.name.replace('models/', '')); } catch (e) {}
+  const flash = names.filter(n => /flash/.test(n));
+  l.innerHTML = `Modellenlijst: <b class="${list.status === 200 ? 'ok' : 'bad'}">${list.status}</b> in ${list.ms} ms<br>` +
+    (flash.length ? `<small>${esc(flash.join(', '))}</small>` : `<small>${esc(list.txt.slice(0, 300))}</small>`);
+
+  // 2. Kleine test per model, één voor één
+  const body = JSON.stringify({
+    contents: [{ role: 'user', parts: [{ text: 'Schat voedingswaarden van: 2 boterhammen met kaas. Antwoord als JSON.' }] }],
+    generationConfig: {
+      responseMimeType: 'application/json', maxOutputTokens: 1024, temperature: 0.4,
+      responseSchema: { type: 'OBJECT', properties: { mealName: { type: 'STRING' }, calories: { type: 'NUMBER' }, protein: { type: 'NUMBER' } } }
+    }
+  });
+  const tests = [
+    ['gemini-2.5-flash', { thinkingBudget: 0 }],
+    ['gemini-flash-lite-latest', null],
+    ['gemini-2.5-flash-lite', null],
+    ['gemini-flash-latest', null]
+  ];
+  for (const [model, thinking] of tests) {
+    const r = line(`<span class="wait">${model}…</span>`);
+    let b = JSON.parse(body); if (thinking) b.generationConfig.thinkingConfig = thinking;
+    const res = await timed(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b) }, 60000);
+    let info = '';
+    try { const j = JSON.parse(res.txt); info = j.candidates ? (j.candidates[0].finishReason + ': ' + (j.candidates[0].content?.parts?.[0]?.text || '').slice(0, 120)) : (j.error?.message || res.txt).slice(0, 220); }
+    catch (e) { info = res.txt.slice(0, 220); }
+    r.innerHTML = `${model}: <b class="${res.status === 200 ? 'ok' : 'bad'}">${res.status}</b> in ${(res.ms / 1000).toFixed(1)} s<br><small>${esc(info)}</small>`;
+  }
+  line('<b>Klaar.</b> Maak een screenshot en stuur hem door.');
+  btn.disabled = false;
+};
+</script>
+</body>
+</html>
