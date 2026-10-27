@@ -131,7 +131,7 @@ try {
 // Gemini API-sleutel: wordt alleen lokaal op dit apparaat bewaard (niet in de repo)
 const API_KEY_STORAGE = 'nutripulse_gemini_key';
 const GEMINI_MODEL = 'gemini-flash-latest';
-const APP_VERSION = '5';
+const APP_VERSION = '6';
 function getApiKey() {
   try { return localStorage.getItem(API_KEY_STORAGE) || ''; } catch (e) { return ''; }
 }
@@ -152,8 +152,9 @@ function aiErrorMessage(err, fallback) {
   if (msg === 'GEEN_API_SLEUTEL') return 'Vul eerst je Gemini API-sleutel in (bovenaan dit scherm).';
   if (/API Fout \((400|401|403)\)/.test(msg) && /key|API_KEY/i.test(msg)) return 'Je Gemini API-sleutel klopt niet. Controleer of je hem goed hebt geplakt.';
   if (/API Fout \(429\)/.test(msg)) return 'Te veel aanvragen bij Gemini. Wacht even en probeer het opnieuw.';
-  if (msg === 'TIMEOUT') return 'Gemini reageert niet (time-out). Controleer je internet en probeer het opnieuw.';
-  if (/API Fout/.test(msg)) return fallback + ' (' + msg.slice(0, 140) + ')';
+  const detail = err && err.summary ? ` [${err.summary}]` : '';
+  if (msg === 'TIMEOUT') return 'Gemini reageert niet (time-out).' + detail;
+  if (/API Fout/.test(msg) || detail) return fallback + ' (' + msg.slice(0, 140) + ')' + detail;
   return fallback;
 }
 
@@ -254,59 +255,96 @@ async function fetchOnce(url, options, timeoutMs) {
 }
 
 // Probeert meerdere Gemini-modellen: valt terug als een model niet bestaat, overbelast is of te traag is
-// Snelle modellen eerst, zonder lang "nadenken" (dat maakte het traag)
+// Snelle modellen eerst, zonder lang "nadenken"
 const GEMINI_MODELS = [
   { name: 'gemini-2.5-flash', thinking: { thinkingBudget: 0 } },
   { name: 'gemini-flash-lite-latest', thinking: { thinkingBudget: 0 } },
   { name: 'gemini-flash-latest', thinking: { thinkingLevel: 'low' } }
 ];
-let preferredModelIndex = 0; // onthoudt welk model werkte
+let preferredModelIndex = 0; // onthoudt welk model het laatst werkte
 
-function withThinking(options, thinking) {
+function tuneRequest(options, thinking) {
   try {
     const body = JSON.parse(options.body);
-    body.generationConfig = { ...(body.generationConfig || {}) };
-    if (thinking) body.generationConfig.thinkingConfig = thinking;
-    else delete body.generationConfig.thinkingConfig;
+    const gc = { ...(body.generationConfig || {}) };
+    // Begrens de lengte: voorkomt dat het model eindeloos doorschrijft (bekende JSON-bug)
+    if (!gc.maxOutputTokens) gc.maxOutputTokens = 4096;
+    if (gc.temperature == null) gc.temperature = 0.4;
+    if (thinking) gc.thinkingConfig = thinking; else delete gc.thinkingConfig;
+    body.generationConfig = gc;
     return { ...options, body: JSON.stringify(body) };
   } catch (e) {
     return options;
   }
 }
 
+function isKeyError(err) {
+  const s = err.status;
+  return (s === 400 || s === 401 || s === 403) && /key|API_KEY|permission/i.test(String(err.message || ''));
+}
+
+// Eén model proberen (met herkansing zonder denk-instelling als het model die niet kent)
+async function tryModel(url, options, idx, signalStop) {
+  const model = GEMINI_MODELS[idx];
+  const u = url.replace(/models\/[^:]+:/, `models/${model.name}:`);
+  let thinking = model.thinking;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (signalStop.done) throw Object.assign(new Error('gestopt'), { status: 'stopped' });
+    const t0 = performance.now();
+    try {
+      const res = await fetchOnce(u, tuneRequest(options, thinking), 45000);
+      const ms = Math.round(performance.now() - t0);
+      const finish = res?.candidates?.[0]?.finishReason;
+      if (finish === 'MAX_TOKENS') throw Object.assign(new Error('antwoord te lang/afgebroken'), { status: 'max_tokens' });
+      console.info(`Gemini ${model.name}: ${ms} ms`);
+      return { res, idx };
+    } catch (err) {
+      err.model = model.name;
+      err.ms = Math.round(performance.now() - t0);
+      if (err.status === 400 && /thinking/i.test(String(err.message)) && thinking) { thinking = null; continue; }
+      if ((err.status === 429 || err.status >= 500) && attempt === 0) { await new Promise(r => setTimeout(r, 1000)); continue; }
+      throw err;
+    }
+  }
+}
+
+// Start het snelste model; als dat na 7 sec nog niets zegt, start ook het volgende (wie eerst klaar is wint)
 async function fetchWithRetry(url, options) {
   if (!url.includes('generativelanguage.googleapis.com')) return fetchOnce(url, options, 30000);
 
   const order = GEMINI_MODELS.map((_, i) => (i + preferredModelIndex) % GEMINI_MODELS.length);
-  let lastErr = null;
-  for (const idx of order) {
-    const model = GEMINI_MODELS[idx];
-    const u = url.replace(/models\/[^:]+:/, `models/${model.name}:`);
-    let thinking = model.thinking;
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const t0 = performance.now();
-        const res = await fetchOnce(u, withThinking(options, thinking), 25000);
-        console.info(`Gemini ${model.name}: ${Math.round(performance.now() - t0)} ms`);
+  const stop = { done: false };
+  const errors = [];
+
+  return await new Promise((resolve, reject) => {
+    let pending = 0, started = 0, finished = false, timer = null;
+    const finish = (fn, val) => { if (finished) return; finished = true; stop.done = true; clearTimeout(timer); fn(val); };
+    const startNext = () => {
+      if (finished || started >= order.length) return;
+      const idx = order[started++];
+      pending++;
+      tryModel(url, options, idx, stop).then(({ res, idx }) => {
         preferredModelIndex = idx;
-        return res;
-      } catch (err) {
-        lastErr = err;
-        console.warn('Gemini aanvraag mislukt:', model.name, err.message);
-        const s = err.status;
-        const msg = String(err.message || '');
-        // Model kent de denk-instelling niet: opnieuw zonder
-        if (s === 400 && /thinking/i.test(msg) && thinking) { thinking = null; continue; }
-        // Sleutel klopt niet: direct stoppen
-        if ((s === 400 || s === 401 || s === 403) && /key|API_KEY|permission/i.test(msg)) throw err;
-        // Model bestaat niet, weigert het verzoek of is te traag: volgende model
-        if (s === 400 || s === 404 || s === 'timeout') break;
-        // Overbelast / limiet: kort wachten en nog één keer
-        if (attempt === 0) await new Promise(r => setTimeout(r, 1000));
-      }
-    }
-  }
-  throw lastErr || new Error('Onbekende fout');
+        finish(resolve, res);
+      }).catch((err) => {
+        pending--;
+        if (err.status !== 'stopped') errors.push(err);
+        console.warn('Gemini mislukt:', err.model, err.status, err.message);
+        if (isKeyError(err)) return finish(reject, err);
+        // Faalt een model snel, start dan direct het volgende
+        startNext();
+        if (pending === 0 && started >= order.length) {
+          const summary = errors.map(e => `${e.model}: ${e.status === 'timeout' ? 'time-out' : e.status} na ${Math.round(e.ms / 1000)}s`).join(', ');
+          const all = new Error(errors.every(e => e.status === 'timeout') ? 'TIMEOUT' : (errors[errors.length - 1]?.message || 'Onbekende fout'));
+          all.summary = summary;
+          finish(reject, all);
+        }
+      });
+      clearTimeout(timer);
+      timer = setTimeout(startNext, 7000);
+    };
+    startNext();
+  });
 }
 
 // 1. Analyseer Foto van Maaltijd
@@ -1148,7 +1186,7 @@ function App() {
     setToastMessage({ text: msg, type });
     setTimeout(() => {
       setToastMessage(null);
-    }, 4000);
+    }, type === "error" ? 12000 : 4000);
   };
 
   // ==========================================
