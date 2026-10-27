@@ -151,6 +151,8 @@ function aiErrorMessage(err, fallback) {
   if (msg === 'GEEN_API_SLEUTEL') return 'Vul eerst je Gemini API-sleutel in (bovenaan dit scherm).';
   if (/API Fout \((400|401|403)\)/.test(msg) && /key|API_KEY/i.test(msg)) return 'Je Gemini API-sleutel klopt niet. Controleer of je hem goed hebt geplakt.';
   if (/API Fout \(429\)/.test(msg)) return 'Te veel aanvragen bij Gemini. Wacht even en probeer het opnieuw.';
+  if (msg === 'TIMEOUT') return 'Gemini reageert niet (time-out). Controleer je internet en probeer het opnieuw.';
+  if (/API Fout/.test(msg)) return fallback + ' (' + msg.slice(0, 140) + ')';
   return fallback;
 }
 
@@ -210,26 +212,55 @@ function ApiKeyBox() {
   );
 }
 
-async function fetchWithRetry(url, options, maxRetries = 4) {
-  let delay = 1000;
-  for (let i = 0; i < maxRetries; i++) {
-    try {
-      const response = await fetch(url, options);
-      if (response.ok) {
-        return await response.json();
-      }
-      if (response.status !== 429 && response.status < 500) {
-        const errText = await response.text();
-        const fatal = new Error(`API Fout (${response.status}): ${errText}`);
-        fatal.noRetry = true;
-        throw fatal;
-      }
-    } catch (err) {
-      if (err.noRetry || i === maxRetries - 1) throw err;
+// Eén aanvraag met tijdslimiet, zodat hij nooit eindeloos blijft hangen
+async function fetchOnce(url, options, timeoutMs) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { ...options, signal: ctrl.signal });
+    if (response.ok) return await response.json();
+    const errText = await response.text();
+    const err = new Error(`API Fout (${response.status}): ${errText.slice(0, 300)}`);
+    err.status = response.status;
+    throw err;
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      const t = new Error('TIMEOUT');
+      t.status = 'timeout';
+      throw t;
     }
-    await new Promise(resolve => setTimeout(resolve, delay));
-    delay *= 2;
+    throw err;
+  } finally {
+    clearTimeout(timer);
   }
+}
+
+// Probeert meerdere Gemini-modellen: valt terug als een model niet bestaat, overbelast is of te traag is
+const GEMINI_FALLBACK_MODELS = ['gemini-flash-latest', 'gemini-2.5-flash', 'gemini-flash-lite-latest'];
+async function fetchWithRetry(url, options) {
+  const isGemini = url.includes('generativelanguage.googleapis.com');
+  const urls = isGemini
+    ? GEMINI_FALLBACK_MODELS.map(m => url.replace(/models\/[^:]+:/, `models/${m}:`))
+    : [url];
+  let lastErr = null;
+  for (const u of urls) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        return await fetchOnce(u, options, 30000);
+      } catch (err) {
+        lastErr = err;
+        console.warn('Gemini aanvraag mislukt:', u.split('?')[0], err.message);
+        const s = err.status;
+        // Sleutel of verzoek klopt niet: direct stoppen
+        if (s === 400 || s === 401 || s === 403) throw err;
+        // Model bestaat niet of is te traag: meteen volgende model
+        if (s === 404 || s === 'timeout') break;
+        // Overbelast / limiet: kort wachten en nog één keer
+        if (attempt === 0) await new Promise(r => setTimeout(r, 1500));
+      }
+    }
+  }
+  throw lastErr || new Error('Onbekende fout');
 }
 
 // 1. Analyseer Foto van Maaltijd
