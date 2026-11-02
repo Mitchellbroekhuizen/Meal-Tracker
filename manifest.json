@@ -2,7 +2,7 @@
   "name": "NutriPulse Meal Tracker",
   "short_name": "NutriPulse",
   "description": "Houd je maaltijden, macro's en water bij.",
-  "id": "./",
+  "id": "/Meal-Tracker/",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
